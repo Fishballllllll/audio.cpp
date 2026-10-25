@@ -284,31 +284,20 @@ std::vector<float> llama3_rope_factors(
 
 // Pack [a; b; ...] projection rows into a single tensor, matching the
 // higgs_audio_tts loader: fewer, larger matmuls per layer. Parts may have
-// different row counts (e.g. q vs k/v in GQA models).
+// different row counts (e.g. q vs k/v in GQA models). Each part is uploaded
+// straight from the source into its row range of the packed tensor.
 core::TensorValue pack_projection_rows(
     core::BackendWeightStore & store,
     const assets::TensorSource & source,
     const std::vector<std::pair<std::string, int64_t>> & parts,
     assets::TensorStorageType storage_type,
     int64_t in_dim) {
-    std::vector<std::byte> packed;
-    int64_t total_out = 0;
-    ggml_type packed_type = GGML_TYPE_COUNT;
+    std::vector<core::BackendWeightStore::TensorPart> sources;
+    sources.reserve(parts.size());
     for (const auto & [name, out_dim] : parts) {
-        const auto part = source.require_tensor(name, storage_type, {out_dim, in_dim});
-        if (packed_type == GGML_TYPE_COUNT) {
-            packed_type = part.type;
-        } else if (part.type != packed_type) {
-            throw std::runtime_error("BreezeTTS packed projection weights require matching storage types");
-        }
-        packed.insert(packed.end(), part.bytes.begin(), part.bytes.end());
-        total_out += out_dim;
+        sources.push_back({name, {out_dim, in_dim}});
     }
-    return store.make_tensor(
-        core::TensorShape::from_dims({total_out, in_dim}),
-        packed_type,
-        packed.data(),
-        packed.size());
+    return store.load_tensor(source, sources, storage_type);
 }
 
 modules::DecoderLayerWeights load_backbone_layer(
