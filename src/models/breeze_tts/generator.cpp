@@ -840,6 +840,14 @@ public:
         engine::debug::trace_log_scalar("breeze_tts.fused_depth.shared_embedding", weights.token_embedding_exact);
     }
 
+    void release_weights() {
+        store_.release();
+    }
+
+    void restore_weights() {
+        store_.restore();
+    }
+
     ~BreezeFusedDepthRuntime() {
         release();
     }
@@ -2005,6 +2013,7 @@ struct BreezeGeneratorRuntime::Impl {
     std::vector<float> depth_uncond_hidden_now_;
     std::vector<float> backbone_pair_input_;
     bool backbone_batched_cfg = false;
+    bool weights_released = false;
     bool backbone_batched_active = false;
 };
 
@@ -2051,6 +2060,42 @@ engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate_stream(
 
 void BreezeGeneratorRuntime::end_stream() {
     impl_->end_stream();
+}
+
+void BreezeGeneratorRuntime::release_weights() {
+    if (impl_->weights_released) {
+        return;
+    }
+    const auto start = Clock::now();
+    impl_->text_encoder.release_weights();
+    impl_->weights->store->release();
+    if (impl_->fused_depth) {
+        impl_->fused_depth->release_weights();
+    }
+    impl_->speech_encoder->release_weights();
+    impl_->speech_decoder->release_weights();
+    impl_->weights_released = true;
+    engine::debug::timing_log_scalar("breeze_tts.weights.release_ms", engine::debug::elapsed_ms(start));
+}
+
+void BreezeGeneratorRuntime::restore_weights() {
+    if (!impl_->weights_released) {
+        return;
+    }
+    const auto start = Clock::now();
+    impl_->text_encoder.restore_weights();
+    impl_->weights->store->restore();
+    if (impl_->fused_depth) {
+        impl_->fused_depth->restore_weights();
+    }
+    impl_->speech_encoder->restore_weights();
+    impl_->speech_decoder->restore_weights();
+    impl_->weights_released = false;
+    engine::debug::timing_log_scalar("breeze_tts.weights.restore_ms", engine::debug::elapsed_ms(start));
+}
+
+bool BreezeGeneratorRuntime::weights_released() const noexcept {
+    return impl_->weights_released;
 }
 
 }  // namespace engine::models::breeze_tts

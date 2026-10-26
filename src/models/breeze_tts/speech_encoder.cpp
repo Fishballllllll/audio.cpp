@@ -835,4 +835,12 @@ void BreezeSpeechEncoderRuntime::release_runtime_graphs() const {
     transformer_graph_.reset();
 }
 
+void BreezeSpeechEncoderRuntime::release_weights() {
+    weights_->store->release();
+}
+
+void BreezeSpeechEncoderRuntime::restore_weights() {
+    weights_->store->restore();
+}
+
 }  // namespace engine::models::breeze_tts

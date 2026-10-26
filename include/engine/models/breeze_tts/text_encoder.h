@@ -27,6 +27,8 @@ public:
 
     BreezeProjectedText encode(const std::vector<int32_t> & input_ids);
     void release_runtime_graphs();
+    void release_weights();
+    void restore_weights();
 
 private:
     struct Impl;

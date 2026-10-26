@@ -146,6 +146,14 @@ struct RequestDispatcher {
       } else if (request.method == "POST" &&
                  request.path == "/v1/tasks/unload_all_models") {
         response = state.handle_unload_all_models();
+      }
+      // Same names as vLLM's sleep mode, so process managers written for it
+      // work unchanged. Any level frees the device weights of models that
+      // support it; the process, graphs and caches stay.
+      else if (request.method == "POST" && request.path == "/sleep") {
+        response = state.handle_weight_sleep(true);
+      } else if (request.method == "POST" && request.path == "/wake_up") {
+        response = state.handle_weight_sleep(false);
       } else {
         auto additional = additional_routes ? additional_routes(request) : std::nullopt;
         if (additional) {

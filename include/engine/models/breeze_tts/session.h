@@ -25,6 +25,7 @@ std::shared_ptr<engine::runtime::IVoiceModelLoader> make_breeze_tts_loader();
 class BreezeTTSSession final
     : public engine::runtime::RuntimeSessionBase
     , public engine::runtime::IOfflineVoiceTaskSession
+    , public engine::runtime::IWeightSleepVoiceTaskSession
     , public engine::runtime::StreamingTtsSessionBase {
 public:
     BreezeTTSSession(
@@ -39,6 +40,8 @@ public:
     engine::runtime::RunMode run_mode() const override;
     void prepare(const engine::runtime::SessionPreparationRequest & request) override;
     engine::runtime::TaskResult run(const engine::runtime::TaskRequest & request) override;
+    void release_weights() override;
+    void restore_weights() override;
 
 private:
     engine::runtime::TaskResult generate_stream(const engine::runtime::TaskRequest & request) override;

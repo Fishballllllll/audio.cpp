@@ -1237,4 +1237,12 @@ void BreezeSpeechDecoderRuntime::release_runtime_graphs() const {
     }
 }
 
+void BreezeSpeechDecoderRuntime::release_weights() {
+    weights_->store->release();
+}
+
+void BreezeSpeechDecoderRuntime::restore_weights() {
+    weights_->store->restore();
+}
+
 }  // namespace engine::models::breeze_tts

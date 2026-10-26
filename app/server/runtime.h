@@ -212,6 +212,7 @@ private:
     HttpResponse handle_voices(const HttpRequest & request) const;
     HttpResponse handle_unload_models(const std::string & body_text);
     HttpResponse handle_unload_all_models();
+    HttpResponse handle_weight_sleep(bool sleep);
     // Background loop started when idle_unload_ms > 0: when the server has gone
     // that long without a model load/run, unloads every resident (non-busy) model.
     void idle_unload_loop();

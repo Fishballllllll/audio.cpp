@@ -264,6 +264,17 @@ public:
     virtual void prepare(const SessionPreparationRequest & request) = 0;
 };
 
+// A session that can give back its device weight memory while staying loaded.
+// Graphs, tokenizers and caches stay, so restoring only uploads the weights
+// again. Runs on a released session restore the weights first.
+class IWeightSleepVoiceTaskSession : public virtual IVoiceTaskSession {
+public:
+    ~IWeightSleepVoiceTaskSession() override = default;
+
+    virtual void release_weights() = 0;
+    virtual void restore_weights() = 0;
+};
+
 class IOfflineVoiceTaskSession : public virtual IVoiceTaskSession {
 public:
     ~IOfflineVoiceTaskSession() override = default;

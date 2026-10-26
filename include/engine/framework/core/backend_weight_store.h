@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -258,8 +259,78 @@ public:
             engine::core::add_uploaded_weight_bytes(ggml_nbytes(upload.tensor));
             engine::core::emit_weight_upload_progress(name_);
         }
+        // Keep the source-backed uploads so restore() can read them again.
+        for (auto & upload : pending_) {
+            if (upload.kind != PendingUploadKind::Bytes) {
+                reloads_.push_back(std::move(upload));
+            }
+        }
         pending_.clear();
         pending_.shrink_to_fit();
+    }
+
+    bool released() const noexcept {
+        return released_;
+    }
+
+    // Frees the device buffer while keeping every tensor header, so graphs that
+    // reference these tensors stay valid; restore() uploads the same contents
+    // into a new buffer. Tensors read from a source are read again on restore
+    // (the source must still be alive); the rest are copied to host RAM here.
+    void release() {
+        if (buffer_ == nullptr || released_) {
+            return;
+        }
+        std::unordered_set<const ggml_tensor *> reloadable;
+        for (const auto & upload : reloads_) {
+            reloadable.insert(upload.tensor->view_src != nullptr ? upload.tensor->view_src : upload.tensor);
+        }
+        snapshots_.clear();
+        for (auto * tensor = ggml_get_first_tensor(ctx_.get()); tensor != nullptr;
+             tensor = ggml_get_next_tensor(ctx_.get(), tensor)) {
+            if (tensor->view_src != nullptr || reloadable.count(tensor) != 0) {
+                continue;
+            }
+            Snapshot snapshot;
+            snapshot.tensor = tensor;
+            snapshot.bytes.resize(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, snapshot.bytes.data(), 0, snapshot.bytes.size());
+            snapshots_.push_back(std::move(snapshot));
+        }
+        ggml_backend_buffer_free(buffer_);
+        buffer_ = nullptr;
+        for (auto * tensor = ggml_get_first_tensor(ctx_.get()); tensor != nullptr;
+             tensor = ggml_get_next_tensor(ctx_.get(), tensor)) {
+            tensor->data = nullptr;
+            tensor->buffer = nullptr;
+        }
+        released_ = true;
+    }
+
+    void restore() {
+        if (!released_) {
+            return;
+        }
+        buffer_ = buffer_type_ != nullptr
+            ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_.get(), buffer_type_)
+            : ggml_backend_alloc_ctx_tensors(ctx_.get(), backend_);
+        if (buffer_ == nullptr) {
+            throw std::runtime_error("failed to reallocate " + name_ + " backend weight buffer");
+        }
+        ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & upload : reloads_) {
+            if (upload.kind == PendingUploadKind::Tensor) {
+                upload.source->set_backend_tensor(upload.tensor, upload.name, upload.storage_type, upload.expected_shape);
+            } else {
+                upload.source->set_backend_f32_tensor(upload.tensor, upload.name, upload.expected_shape);
+            }
+        }
+        for (const auto & snapshot : snapshots_) {
+            ggml_backend_tensor_set(snapshot.tensor, snapshot.bytes.data(), 0, snapshot.bytes.size());
+        }
+        snapshots_.clear();
+        snapshots_.shrink_to_fit();
+        released_ = false;
     }
 
 private:
@@ -284,6 +355,11 @@ private:
         assets::TensorStorageType storage_type = assets::TensorStorageType::F32;
         std::vector<int64_t> expected_shape;
         PendingUploadKind kind = PendingUploadKind::Bytes;
+        std::vector<std::byte> bytes;
+    };
+
+    struct Snapshot {
+        ggml_tensor * tensor = nullptr;
         std::vector<std::byte> bytes;
     };
 
@@ -522,6 +598,9 @@ private:
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
     ggml_backend_buffer_t buffer_ = nullptr;
     std::vector<PendingUpload> pending_;
+    std::vector<PendingUpload> reloads_;
+    std::vector<Snapshot> snapshots_;
+    bool released_ = false;
 };
 
 }  // namespace engine::core

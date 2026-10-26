@@ -2671,4 +2671,51 @@ HttpResponse ParallelServerState::handle_unload_all_models() {
     return json_response(out.str());
 }
 
+HttpResponse ParallelServerState::handle_weight_sleep(bool sleep) {
+    std::vector<std::pair<std::string, LoadedModel *>> registered;
+    {
+        std::lock_guard<std::mutex> state_lock(models_mutex_);
+        for (const auto & model : models_) {
+            registered.emplace_back(model->registered_id, model.get());
+        }
+    }
+    std::vector<std::string> changed;
+    for (const auto & [id, model] : registered) {
+        std::optional<ModelSlots::Pending> pending;
+        {
+            std::lock_guard<std::mutex> admission_lock(bulk_admission_mutex_);
+            pending = model->busy.queue_management(0, id);
+        }
+        auto lease = pending->acquire();
+        if (!model->resident() || model->sessions == nullptr) {
+            continue;
+        }
+        bool supported = false;
+        for (size_t slot = 0; slot < model->sessions->size(); ++slot) {
+            auto * sleeper = dynamic_cast<engine::runtime::IWeightSleepVoiceTaskSession *>(&model->sessions->at(slot));
+            if (sleeper == nullptr) {
+                continue;
+            }
+            if (sleep) {
+                sleeper->release_weights();
+            } else {
+                sleeper->restore_weights();
+            }
+            supported = true;
+        }
+        if (supported) {
+            changed.push_back(id);
+        }
+    }
+
+    std::ostringstream out;
+    out << (sleep ? "{\"sleeping\":[" : "{\"awake\":[");
+    for (size_t i = 0; i < changed.size(); ++i) {
+        if (i != 0) { out << ","; }
+        out << json_quote(changed[i]);
+    }
+    out << "]}";
+    return json_response(out.str());
+}
+
 }  // namespace minitts::server

@@ -52,6 +52,8 @@ public:
         const BreezeSpeechCodes & reference_codes,
         const BreezeSpeechCodes & generated_codes) const;
     void release_runtime_graphs() const;
+    void release_weights();
+    void restore_weights();
 
 private:
     std::vector<float> decode_window_samples(

@@ -318,6 +318,7 @@ runtime::TaskResult BreezeTTSSession::run(const runtime::TaskRequest & request) 
     const auto wall_start = std::chrono::steady_clock::now();
     validate_request_options(request.options, *contract_);
     require_prepared("BreezeTTS run");
+    generator_->restore_weights();
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("BreezeTTS run requires an offline session");
     }
@@ -361,6 +362,7 @@ runtime::TaskResult BreezeTTSSession::run(const runtime::TaskRequest & request) 
 runtime::TaskResult BreezeTTSSession::generate_stream(const runtime::TaskRequest & request) {
     validate_request_options(request.options, *contract_);
     require_prepared("BreezeTTS streaming");
+    generator_->restore_weights();
     if (!request.text_input.has_value() || request.text_input->text.empty()) {
         throw std::runtime_error("BreezeTTS streaming requires text input");
     }
@@ -414,6 +416,14 @@ runtime::TaskResult BreezeTTSSession::generate_stream(const runtime::TaskRequest
     result.audio_output = std::move(merged);
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(started_at));
     return result;
+}
+
+void BreezeTTSSession::release_weights() {
+    generator_->release_weights();
+}
+
+void BreezeTTSSession::restore_weights() {
+    generator_->restore_weights();
 }
 
 void BreezeTTSSession::reset_stream_state() {

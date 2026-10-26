@@ -279,4 +279,12 @@ void BreezeT5Gemma2TextEncoderRuntime::release_runtime_graphs() {
     impl_->release_runtime_graphs();
 }
 
+void BreezeT5Gemma2TextEncoderRuntime::release_weights() {
+    impl_->weights->store->release();
+}
+
+void BreezeT5Gemma2TextEncoderRuntime::restore_weights() {
+    impl_->weights->store->restore();
+}
+
 }  // namespace engine::models::breeze_tts

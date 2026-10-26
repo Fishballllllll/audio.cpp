@@ -77,6 +77,11 @@ public:
         engine::runtime::StreamEventCallback sink,
         BreezeSpeechCodes * generated_codes = nullptr);
     void end_stream();
+    // Frees the device weights of every part (graphs and caches stay) and
+    // uploads them again; see IWeightSleepVoiceTaskSession.
+    void release_weights();
+    void restore_weights();
+    bool weights_released() const noexcept;
 
 private:
     struct Impl;

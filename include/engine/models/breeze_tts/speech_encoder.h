@@ -42,6 +42,8 @@ public:
 
     BreezeSpeechCodes encode(const runtime::AudioBuffer & audio) const;
     void release_runtime_graphs() const;
+    void release_weights();
+    void restore_weights();
 
 private:
     std::shared_ptr<const BreezeTTSAssets> assets_;

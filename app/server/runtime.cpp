@@ -2607,4 +2607,33 @@ HttpResponse ServerState::handle_unload_all_models() {
     return json_response(out.str());
 }
 
+HttpResponse ServerState::handle_weight_sleep(bool sleep) {
+    std::vector<std::string> changed;
+    for (auto & model : models_) {
+        if (model->session == nullptr) {
+            continue;
+        }
+        auto * sleeper = dynamic_cast<engine::runtime::IWeightSleepVoiceTaskSession *>(model->session.get());
+        if (sleeper == nullptr) {
+            continue;
+        }
+        [[maybe_unused]] BusyGuard::Lock lock = model->busy.acquire(0, model->config.id);
+        if (sleep) {
+            sleeper->release_weights();
+        } else {
+            sleeper->restore_weights();
+        }
+        changed.push_back(model->config.id);
+    }
+
+    std::ostringstream out;
+    out << (sleep ? "{\"sleeping\":[" : "{\"awake\":[");
+    for (size_t i = 0; i < changed.size(); ++i) {
+        if (i != 0) { out << ","; }
+        out << json_quote(changed[i]);
+    }
+    out << "]}";
+    return json_response(out.str());
+}
+
 }  // namespace minitts::server
