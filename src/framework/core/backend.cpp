@@ -2,6 +2,7 @@
 #include "engine/framework/core/execution_context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -579,6 +580,40 @@ void free_backend_graph_plan(ggml_backend_t backend, ggml_backend_graph_plan_t &
     }
 }
 
+namespace {
+
+std::atomic<bool> g_weight_buffers_moved{false};
+
+void repoint_view(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->view_src == nullptr || tensor->view_src->data == nullptr) {
+        return;
+    }
+    // The buffer object is replaced even when the new allocation lands at the
+    // same address, so compare both.
+    void * data = static_cast<char *>(tensor->view_src->data) + tensor->view_offs;
+    if (tensor->data != data || tensor->buffer != tensor->view_src->buffer) {
+        tensor->data = data;
+        tensor->buffer = tensor->view_src->buffer;
+    }
+}
+
+void repoint_graph_views(ggml_cgraph * graph) {
+    const int nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        repoint_view(node);
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            repoint_view(node->src[src]);
+        }
+    }
+}
+
+}  // namespace
+
+void note_weight_buffers_moved() {
+    g_weight_buffers_moved.store(true, std::memory_order_release);
+}
+
 ggml_status compute_backend_graph(
     ggml_backend_t backend,
     ggml_cgraph * graph,
@@ -586,6 +621,9 @@ ggml_status compute_backend_graph(
     const char * label) {
     if (backend == nullptr || graph == nullptr) {
         return GGML_STATUS_FAILED;
+    }
+    if (g_weight_buffers_moved.load(std::memory_order_acquire)) {
+        repoint_graph_views(graph);
     }
 #ifndef NDEBUG
     if (plan == nullptr && backend_graph_validation_enabled()) {

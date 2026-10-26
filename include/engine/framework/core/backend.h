@@ -94,6 +94,11 @@ ggml_status compute_backend_graph(
     ggml_cgraph * graph,
     ggml_backend_graph_plan_t plan = nullptr,
     const char * label = nullptr);
+// A view copies its source's address and buffer when it is created, so a graph
+// built once and reused keeps pointing at the old weights (and a freed buffer
+// object) after a weight buffer is reallocated (BackendWeightStore::restore). Once this has been called,
+// compute_backend_graph re-points every view in a graph before running it.
+void note_weight_buffers_moved();
 
 struct HostGraphPlan {
     ggml_backend_graph_plan_t plan = nullptr;

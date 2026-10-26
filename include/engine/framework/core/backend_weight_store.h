@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <memory>
@@ -297,6 +298,7 @@ public:
             ggml_backend_tensor_get(tensor, snapshot.bytes.data(), 0, snapshot.bytes.size());
             snapshots_.push_back(std::move(snapshot));
         }
+        released_base_ = ggml_backend_buffer_get_base(buffer_);
         ggml_backend_buffer_free(buffer_);
         buffer_ = nullptr;
         for (auto * tensor = ggml_get_first_tensor(ctx_.get()); tensor != nullptr;
@@ -311,13 +313,26 @@ public:
         if (!released_) {
             return;
         }
+        // Testing aid: hold a small buffer while reallocating so the weights
+        // land at a new address, as they can in normal use.
+        ggml_backend_buffer_t shift = nullptr;
+        if (std::getenv("AUDIOCPP_DEBUG_SHIFT_RESTORED_WEIGHTS") != nullptr) {
+            shift = buffer_type_ != nullptr
+                ? ggml_backend_buft_alloc_buffer(buffer_type_, 64ull << 20)
+                : ggml_backend_alloc_buffer(backend_, 64ull << 20);
+        }
         buffer_ = buffer_type_ != nullptr
             ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_.get(), buffer_type_)
             : ggml_backend_alloc_ctx_tensors(ctx_.get(), backend_);
         if (buffer_ == nullptr) {
             throw std::runtime_error("failed to reallocate " + name_ + " backend weight buffer");
         }
+        if (shift != nullptr) {
+            ggml_backend_buffer_free(shift);
+        }
         ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        debug::trace_log_scalar(name_ + ".restore_moved", ggml_backend_buffer_get_base(buffer_) != released_base_);
+        note_weight_buffers_moved();
         for (const auto & upload : reloads_) {
             if (upload.kind == PendingUploadKind::Tensor) {
                 upload.source->set_backend_tensor(upload.tensor, upload.name, upload.storage_type, upload.expected_shape);
@@ -600,6 +615,7 @@ private:
     std::vector<PendingUpload> pending_;
     std::vector<PendingUpload> reloads_;
     std::vector<Snapshot> snapshots_;
+    void * released_base_ = nullptr;
     bool released_ = false;
 };
 
