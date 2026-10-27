@@ -94,6 +94,9 @@ ggml_status compute_backend_graph(
     ggml_cgraph * graph,
     ggml_backend_graph_plan_t plan = nullptr,
     const char * label = nullptr);
+// Like compute_backend_graph, but returns once the graph is queued on the
+// backend; synchronize the backend before reading its results.
+ggml_status compute_backend_graph_async(ggml_backend_t backend, ggml_cgraph * graph, const char * label = nullptr);
 // A view copies its source's address and buffer when it is created, so a graph
 // built once and reused keeps pointing at the old weights (and a freed buffer
 // object) after a weight buffer is reallocated (BackendWeightStore::restore). Once this has been called,

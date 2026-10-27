@@ -85,8 +85,8 @@ struct PerfPreset {
 };
 
 constexpr PerfPreset kPerfPresets[] = {
-    {"off", {false, false, false, false}},
-    {"cuda_perf", {true, true, true, true}},
+    {"off", {false, false, false, false, false}},
+    {"cuda_perf", {true, true, true, true, true}},
 };
 
 // perf_mode picks the defaults; explicit options override the preset.
@@ -103,6 +103,7 @@ BreezePerfOptions perf_options_from_options(const runtime::SessionOptions & opti
         {"breeze_tts.direct_prefill", &BreezePerfOptions::direct_prefill},
         {"breeze_tts.skip_cache_round", &BreezePerfOptions::skip_cache_round},
         {"breeze_tts.batched_cfg", &BreezePerfOptions::batched_cfg},
+        {"breeze_tts.pipelined_frames", &BreezePerfOptions::pipelined_frames},
     };
     for (const auto & [key, member] : flags) {
         if (const auto value = runtime::find_option(options.options, {key})) {
@@ -142,7 +143,7 @@ void validate_session_options(
                              "breeze_tts.perf_mode", "breeze_tts.fused_depth",
                              "breeze_tts.direct_prefill", "breeze_tts.skip_cache_round",
                              "breeze_tts.round_bf16_fusion", "breeze_tts.batched_cfg",
-                             "breeze_tts.exec_plan"}) {
+                             "breeze_tts.pipelined_frames", "breeze_tts.exec_plan"}) {
         if (contract.session_option_keys.find(key) == contract.session_option_keys.end()) {
             validation_options.options.erase(key);
         }

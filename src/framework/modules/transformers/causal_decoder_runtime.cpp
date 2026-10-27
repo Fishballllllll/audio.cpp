@@ -1036,6 +1036,30 @@ public:
         return run_batched_decode_step();
     }
 
+    ggml_tensor * batched_decode_embedding_input() {
+        ensure_batched_decode_started();
+        if (batched_decode_input_kind_ != InputKind::Embedding) {
+            throw std::runtime_error("QwenCausalDecodeRuntime batched decode graph expects embeddings");
+        }
+        return batched_decode_input_;
+    }
+
+    CausalDecoderBatchedStepTensors enqueue_batched_decode_step() {
+        ensure_batched_decode_started();
+        if (batched_decode_input_kind_ != InputKind::Embedding) {
+            throw std::runtime_error("QwenCausalDecodeRuntime batched decode graph expects embeddings");
+        }
+        if (config_.readback_round_type.has_value()) {
+            throw std::runtime_error("QwenCausalDecodeRuntime queued batched decode does not apply readback rounding");
+        }
+        const auto step = prepare_batched_decode_step();
+        if (core::compute_backend_graph_async(backend_, step.graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("QwenCausalDecodeRuntime batched decode graph compute failed");
+        }
+        batched_decode_cache_.advance_after_direct_append(1);
+        return {step.logits, step.hidden};
+    }
+
     int64_t decode_cache_steps() const noexcept {
         return decode_cache_steps_;
     }
@@ -1904,7 +1928,15 @@ private:
         decode_cache_.advance_after_direct_append(1);
     }
 
-    CausalDecoderStepResult run_batched_decode_step() {
+    struct BatchedDecodeStepGraph {
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * logits = nullptr;
+        ggml_tensor * hidden = nullptr;
+    };
+
+    // Uploads the positions, mask and cache slots of the next batched step and
+    // picks its graph; shared by the synchronous and queued decode paths.
+    BatchedDecodeStepGraph prepare_batched_decode_step() {
         if (batched_decode_cache_.valid_steps() >= batched_decode_cache_steps_) {
             throw std::runtime_error("QwenCausalDecodeRuntime batched decode cache exhausted");
         }
@@ -1978,7 +2010,14 @@ private:
             logits = active->logits;
             hidden = active->hidden;
         }
-        const ggml_status status = core::compute_backend_graph(backend_, graph);
+        return {graph, logits, hidden};
+    }
+
+    CausalDecoderStepResult run_batched_decode_step() {
+        const auto step = prepare_batched_decode_step();
+        auto * logits = step.logits;
+        auto * hidden = step.hidden;
+        const ggml_status status = core::compute_backend_graph(backend_, step.graph);
         ggml_backend_synchronize(backend_);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("QwenCausalDecodeRuntime batched decode graph compute failed");
@@ -2383,6 +2422,14 @@ CausalDecoderStepResult CausalDecoderRuntime::decode_embeddings_batched(
     const std::vector<float> & embeddings,
     int64_t batch_size) {
     return impl_->decode_embeddings_batched(embeddings, batch_size);
+}
+
+ggml_tensor * CausalDecoderRuntime::batched_decode_embedding_input() {
+    return impl_->batched_decode_embedding_input();
+}
+
+CausalDecoderBatchedStepTensors CausalDecoderRuntime::enqueue_batched_decode_step() {
+    return impl_->enqueue_batched_decode_step();
 }
 
 runtime::TransformerBatchedKVState CausalDecoderRuntime::export_batched_decode_state() const {

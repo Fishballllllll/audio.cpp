@@ -52,6 +52,10 @@ struct BreezePerfOptions {
     bool skip_cache_round = false;
     // With CFG, decode both backbone branches as one batch-2 step.
     bool batched_cfg = false;
+    // Streaming CUDA decode keeps each frame on the device: the depth tokens are
+    // embedded and fed to the next backbone step without a host round trip, and
+    // the host only samples the first codebook. Same computation, same output.
+    bool pipelined_frames = false;
     // breeze_tts.exec_plan depth.impl=cuda: run the fused depth frame with the
     // hand-written CUDA kernels instead of the ggml graph (needs fused_depth).
     bool cuda_depth = false;

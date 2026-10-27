@@ -26,6 +26,7 @@ TmpHostProf g_hp;
 
 #if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
 #include "cuda_depth.h"
+#include "cuda_pipeline.h"
 #endif
 
 #include "engine/framework/core/backend.h"
@@ -903,15 +904,8 @@ public:
         std::mt19937 & rng,
         const sampling::TorchCudaSamplingPolicy & policy,
         uint64_t offset_blocks) {
-        const Key key{
-            paired ? 2 : 1,
-            paired ? request.guidance_scale : 1.0F,
-            request.depth_temperature,
-            candidates_for(request.top_k),
-            request.top_p};
-        if (!built_ || !(key == key_)) {
-            build(key);
-        }
+        prepare(request, paired);
+        const Key key = key_;
         const size_t hidden_bytes = static_cast<size_t>(config_.hidden_size) * sizeof(float);
         auto hp_set = TmpHostProf::now(); // TMPDIAG
         ggml_backend_tensor_set(hidden_in_, cond_hidden, 0, hidden_bytes);
@@ -921,33 +915,7 @@ public:
         ggml_backend_tensor_set(first_token_in_, &first_token, 0, sizeof(int32_t));
         g_hp.add(3, hp_set); // TMPDIAG
         auto hp_noise = TmpHostProf::now(); // TMPDIAG
-        // Exponential race: argmax(logits / T - log E) samples softmax(logits / T).
-        // With the torch CUDA policy, E is the per-codebook sampler's own draw for
-        // each token, so the device picks the token it would have picked.
-        const int64_t steps = config_.num_codebooks - 1;
-        if (policy.cuda_fast_path) {
-            const auto population = static_cast<uint64_t>(config_.vocab_size);
-            const uint64_t step_blocks = sampling::torch_cuda_tensor_iterator_offset_blocks(population, policy);
-            for (int64_t step = 0; step < steps; ++step) {
-                const uint64_t offset = offset_blocks + static_cast<uint64_t>(step) * step_blocks;
-                float * row = noise_staging_.data() + step * kCodecCodebookSize;
-                for (int64_t token = 0; token < kCodecCodebookSize; ++token) {
-                    const float exponential = sampling::torch_cuda_tensor_iterator_exponential_element_at_offset(
-                        request.seed,
-                        population,
-                        static_cast<uint64_t>(token),
-                        offset,
-                        policy.multiprocessor_count,
-                        policy.max_threads_per_multiprocessor);
-                    row[token] = static_cast<float>(-std::log(static_cast<double>(exponential)));
-                }
-            }
-        } else {
-            for (float & value : noise_staging_) {
-                const double uniform = (static_cast<double>(rng()) + 0.5) / 4294967296.0;
-                value = static_cast<float>(-std::log(-std::log(uniform)));
-            }
-        }
+        fill_noise(noise_staging_.data(), request, rng, policy, offset_blocks);
         g_hp.add(4, hp_noise); // TMPDIAG
         auto hp_nset = TmpHostProf::now(); // TMPDIAG
         ggml_backend_tensor_set(noise_in_, noise_staging_.data(), 0, noise_staging_.size() * sizeof(float));
@@ -1023,6 +991,75 @@ public:
             cmp_cuda_.clear();
         }
         return frame;
+    }
+
+    // Builds the graph for this request's sampling settings if needed.
+    void prepare(const BreezeGenerationRequest & request, bool paired) {
+        const Key key{
+            paired ? 2 : 1,
+            paired ? request.guidance_scale : 1.0F,
+            request.depth_temperature,
+            candidates_for(request.top_k),
+            request.top_p};
+        if (!built_ || !(key == key_)) {
+            build(key);
+        }
+    }
+
+    size_t noise_floats() const {
+        return static_cast<size_t>((config_.num_codebooks - 1) * kCodecCodebookSize);
+    }
+
+    // Writes one frame's sampling noise, [codebook - 1][token], into out.
+    void fill_noise(
+        float * out,
+        const BreezeGenerationRequest & request,
+        std::mt19937 & rng,
+        const sampling::TorchCudaSamplingPolicy & policy,
+        uint64_t offset_blocks) const {
+        // Exponential race: argmax(logits / T - log E) samples softmax(logits / T).
+        // With the torch CUDA policy, E is the per-codebook sampler's own draw for
+        // each token, so the device picks the token it would have picked.
+        const int64_t steps = config_.num_codebooks - 1;
+        if (policy.cuda_fast_path) {
+            const auto population = static_cast<uint64_t>(config_.vocab_size);
+            const uint64_t step_blocks = sampling::torch_cuda_tensor_iterator_offset_blocks(population, policy);
+            for (int64_t step = 0; step < steps; ++step) {
+                const uint64_t offset = offset_blocks + static_cast<uint64_t>(step) * step_blocks;
+                float * row = out + step * kCodecCodebookSize;
+                for (int64_t token = 0; token < kCodecCodebookSize; ++token) {
+                    const float exponential = sampling::torch_cuda_tensor_iterator_exponential_element_at_offset(
+                        request.seed,
+                        population,
+                        static_cast<uint64_t>(token),
+                        offset,
+                        policy.multiprocessor_count,
+                        policy.max_threads_per_multiprocessor);
+                    row[token] = static_cast<float>(-std::log(static_cast<double>(exponential)));
+                }
+            }
+        } else {
+            const size_t count = noise_floats();
+            for (size_t i = 0; i < count; ++i) {
+                const double uniform = (static_cast<double>(rng()) + 0.5) / 4294967296.0;
+                out[i] = static_cast<float>(-std::log(-std::log(uniform)));
+            }
+        }
+    }
+
+    // Pipelined frames drive the graph directly: they write the inputs and read
+    // the tokens on the backend stream and queue the graph without waiting.
+    ggml_tensor * hidden_input() const { return hidden_in_; }
+    ggml_tensor * first_token_input() const { return first_token_in_; }
+    ggml_tensor * noise_input() const { return noise_in_; }
+    const std::vector<ggml_tensor *> & token_outputs() const { return tokens_out_; }
+    const core::TensorValue & embedding_table() const { return table_; }
+
+    void enqueue() {
+        core::set_backend_threads(backend_, threads_);
+        if (core::compute_backend_graph_async(backend_, graph_, "breeze_tts.fused_depth") != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("BreezeTTS fused depth graph compute failed");
+        }
     }
 
 private:
@@ -1436,6 +1473,8 @@ struct BreezeGeneratorRuntime::Impl {
         engine::debug::trace_log_scalar("breeze_tts.fused_depth", fused_depth != nullptr);
         backbone_batched_cfg = cuda && perf.batched_cfg;
         engine::debug::trace_log_scalar("breeze_tts.backbone_batched_cfg", backbone_batched_cfg);
+        pipelined_frames = cuda && perf.pipelined_frames;
+        engine::debug::trace_log_scalar("breeze_tts.pipelined_frames", pipelined_frames);
         const auto codec_storage_type = std::getenv("TMP_CODEC_NATIVE") ? assets::TensorStorageType::Native : storage_type; // TMPDIAG
         speech_encoder = std::make_unique<BreezeSpeechEncoderRuntime>(
             this->assets,
@@ -1974,6 +2013,257 @@ struct BreezeGeneratorRuntime::Impl {
         return 0;
     }
 
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+    // Pinned host staging and a device scratch tensor for pipelined frames.
+    struct PipelineBuffers {
+        ggml_backend_buffer_t host = nullptr;
+        ggml_backend_buffer_t device = nullptr;
+        std::unique_ptr<ggml_context, GgmlContextDeleter> device_ctx;
+        ggml_tensor * codes = nullptr;       // [num_codebooks] i32 on the device
+        size_t logits_floats = 0;
+        size_t noise_floats = 0;
+        float * logits = nullptr;            // [logits_size, 2]
+        float * noise[2] = {nullptr, nullptr};
+        int32_t * codes_host = nullptr;      // [num_codebooks]
+        int32_t * first_token = nullptr;
+
+        ~PipelineBuffers() {
+            if (host != nullptr) {
+                ggml_backend_buffer_free(host);
+            }
+            if (device != nullptr) {
+                ggml_backend_buffer_free(device);
+            }
+        }
+    };
+    std::unique_ptr<PipelineBuffers> pipeline_buffers_;
+
+    PipelineBuffers & pipeline_buffers(size_t logits_floats, size_t noise_floats) {
+        auto & current = pipeline_buffers_;
+        if (current != nullptr && current->logits_floats == logits_floats && current->noise_floats == noise_floats) {
+            return *current;
+        }
+        current.reset();
+        auto buffers = std::make_unique<PipelineBuffers>();
+        ggml_backend_t backend = execution.backend();
+        ggml_backend_buffer_type_t host_type = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        if (host_type == nullptr) {
+            throw std::runtime_error("BreezeTTS pipelined frames need a pinned host buffer type");
+        }
+        const size_t align = 256;
+        const auto round_up = [&](size_t bytes) { return (bytes + align - 1) / align * align; };
+        const size_t codebooks = static_cast<size_t>(assets->config.num_codebooks);
+        const size_t logits_bytes = round_up(logits_floats * sizeof(float));
+        const size_t noise_bytes = round_up(noise_floats * sizeof(float));
+        const size_t codes_bytes = round_up(codebooks * sizeof(int32_t));
+        const size_t total = logits_bytes + 2 * noise_bytes + codes_bytes + round_up(sizeof(int32_t));
+        buffers->host = ggml_backend_buft_alloc_buffer(host_type, total);
+        if (buffers->host == nullptr) {
+            throw std::runtime_error("BreezeTTS pipelined frames could not allocate pinned host memory");
+        }
+        auto * base = static_cast<char *>(ggml_backend_buffer_get_base(buffers->host));
+        buffers->logits = reinterpret_cast<float *>(base);
+        buffers->noise[0] = reinterpret_cast<float *>(base + logits_bytes);
+        buffers->noise[1] = reinterpret_cast<float *>(base + logits_bytes + noise_bytes);
+        buffers->codes_host = reinterpret_cast<int32_t *>(base + logits_bytes + 2 * noise_bytes);
+        buffers->first_token = reinterpret_cast<int32_t *>(base + logits_bytes + 2 * noise_bytes + codes_bytes);
+        buffers->device_ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        if (buffers->device_ctx == nullptr) {
+            throw std::runtime_error("failed to initialize BreezeTTS pipelined frame context");
+        }
+        buffers->codes = ggml_new_tensor_1d(buffers->device_ctx.get(), GGML_TYPE_I32, static_cast<int64_t>(codebooks));
+        buffers->device = ggml_backend_alloc_ctx_tensors(buffers->device_ctx.get(), backend);
+        if (buffers->device == nullptr) {
+            throw std::runtime_error("failed to allocate BreezeTTS pipelined frame scratch");
+        }
+        buffers->logits_floats = logits_floats;
+        buffers->noise_floats = noise_floats;
+        current = std::move(buffers);
+        return *current;
+    }
+#endif
+
+    bool pipeline_usable(const StreamState & state) const {
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        if (!pipelined_frames || fused_depth == nullptr || !state.use_cfg || !state.uncond.has_value() ||
+            !backbone_batched_active || !sampling_policy.cuda_fast_path ||
+            assets->config.num_codebooks > kBreezeFrameEmbedMaxCodebooks ||
+            core::backend_cuda_stream(execution.backend()) == nullptr) {
+            return false;
+        }
+        const ggml_type table_type = fused_depth->embedding_table().type;
+        return table_type == GGML_TYPE_F32 || table_type == GGML_TYPE_F16 || table_type == GGML_TYPE_BF16;
+#else
+        (void)state;
+        return false;
+#endif
+    }
+
+    // step_frame_once() for every frame, with the same sampling, the same graphs
+    // and the same inputs, but the frame stays on the device: the depth tokens are
+    // embedded there and the next backbone step is queued behind the depth graph.
+    // The host reads back the logits and the codes once per frame, samples the
+    // first codebook, and prepares the next frame's noise while the device runs.
+    void run_pipelined_frames(BreezeSpeechCodes & captured, bool capture) {
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        auto & state = *stream_;
+        const auto & request = state.request;
+        const auto & config = assets->config;
+        ggml_backend_t backend = execution.backend();
+        void * stream = core::backend_cuda_stream(backend);
+        const int codebooks = static_cast<int>(config.num_codebooks);
+        const size_t logits_size = state.cond.logits.size();
+        if (logits_size == 0 || state.uncond->logits.size() != logits_size) {
+            throw std::runtime_error("BreezeTTS CFG logits shape mismatch");
+        }
+        const size_t hidden_bytes = static_cast<size_t>(config.hidden_size) * sizeof(float);
+        if (state.cond.hidden.size() * sizeof(float) != hidden_bytes ||
+            state.uncond->hidden.size() * sizeof(float) != hidden_bytes) {
+            throw std::runtime_error("BreezeTTS pipelined frames: backbone hidden size mismatch");
+        }
+
+        fused_depth->prepare(request, true);
+        ggml_tensor * hidden_in = fused_depth->hidden_input();
+        ggml_tensor * first_in = fused_depth->first_token_input();
+        ggml_tensor * noise_in = fused_depth->noise_input();
+        const auto & tokens_out = fused_depth->token_outputs();
+        ggml_tensor * backbone_in = backbone_cond->batched_decode_embedding_input();
+        if (static_cast<int>(tokens_out.size()) != codebooks - 1 || ggml_nbytes(backbone_in) != 2 * hidden_bytes ||
+            ggml_nbytes(hidden_in) != 2 * hidden_bytes) {
+            throw std::runtime_error("BreezeTTS pipelined frames: graph shape mismatch");
+        }
+        auto & buffers = pipeline_buffers(2 * logits_size, fused_depth->noise_floats());
+        const size_t noise_bytes = buffers.noise_floats * sizeof(float);
+
+        // The first frame starts from the prefill's host results.
+        ggml_backend_tensor_set(hidden_in, state.cond.hidden.data(), 0, hidden_bytes);
+        ggml_backend_tensor_set(hidden_in, state.uncond->hidden.data(), hidden_bytes, hidden_bytes);
+        const float * cond_logits = state.cond.logits.data();
+        const float * uncond_logits = state.uncond->logits.data();
+
+        const uint64_t first_blocks =
+            sampling::torch_cuda_tensor_iterator_offset_blocks(static_cast<uint64_t>(logits_size), sampling_policy);
+        const uint64_t step_blocks =
+            sampling::torch_cuda_tensor_iterator_offset_blocks(static_cast<uint64_t>(config.vocab_size), sampling_policy);
+        uint64_t noise_offset[2] = {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
+        int slot = 0;
+
+        BreezeFrameEmbedArgs embed;
+        embed.vocab = config.vocab_size;
+        embed.dim = config.hidden_size;
+        embed.num_codebooks = codebooks;
+        embed.batch = 2;
+        embed.tokens[0] = static_cast<const int32_t *>(first_in->data);
+        for (int codebook = 1; codebook < codebooks; ++codebook) {
+            embed.tokens[codebook] = static_cast<const int32_t *>(tokens_out[static_cast<size_t>(codebook - 1)]->data);
+        }
+        std::vector<int32_t> frame(static_cast<size_t>(codebooks));
+        try {
+            while (true) {
+                if (state.done || state.steps_taken >= request.max_tokens) {
+                    state.done = true;
+                    break;
+                }
+                ++state.steps_taken;
+                std::vector<float> logits(logits_size);
+                for (size_t i = 0; i < logits_size; ++i) {
+                    logits[i] = uncond_logits[i] + request.guidance_scale * (cond_logits[i] - uncond_logits[i]);
+                }
+                suppress_reserved(logits, kCodecCodebookSize, config.vocab_size);
+                const int32_t first_token = sample_logits(
+                    std::move(logits),
+                    state.first_codebook_history,
+                    state.first_options,
+                    state.scratch,
+                    state.fallback_rng,
+                    &sampling_policy,
+                    request.seed,
+                    state.sample_call_index,
+                    state.offset_blocks,
+                    "BreezeTTS semantic sampler");
+                if (first_token == config.vocab_size) {
+                    state.done = true;
+                    break;
+                }
+                if (first_token == config.codebook_pad_token_id) {
+                    continue;
+                }
+                const auto frame_start = Clock::now();
+                if (noise_offset[slot] != state.offset_blocks) {
+                    fused_depth->fill_noise(buffers.noise[slot], request, state.fallback_rng, sampling_policy, state.offset_blocks);
+                    noise_offset[slot] = state.offset_blocks;
+                }
+                *buffers.first_token = first_token;
+                ggml_backend_tensor_set_async(backend, first_in, buffers.first_token, 0, sizeof(int32_t));
+                ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[slot], 0, noise_bytes);
+                fused_depth->enqueue();
+                // Advance the torch RNG stream past the depth draws, as generate_frame() does.
+                for (int codebook = 1; codebook < codebooks; ++codebook) {
+                    ++state.sample_call_index;
+                    state.offset_blocks += step_blocks;
+                }
+                state.first_codebook_history.push_back(first_token);
+
+                const auto & table = fused_depth->embedding_table();
+                embed.table = table.tensor->data;
+                embed.row_bytes = table.tensor->nb[1];
+                embed.type = table.tensor->type;
+                embed.rows = table.tensor->ne[1];
+                embed.out = static_cast<float *>(backbone_in->data);
+                embed.codes = static_cast<int32_t *>(buffers.codes->data);
+                breeze_frame_embed(stream, embed);
+                const auto step = backbone_cond->enqueue_batched_decode_step();
+                if (step.logits == nullptr || step.hidden == nullptr ||
+                    ggml_nelements(step.logits) != static_cast<int64_t>(2 * logits_size) ||
+                    ggml_nbytes(step.hidden) != 2 * hidden_bytes || !ggml_is_contiguous(step.hidden) ||
+                    !ggml_is_contiguous(step.logits)) {
+                    throw std::runtime_error("BreezeTTS pipelined frames: backbone output shape mismatch");
+                }
+                breeze_copy_device_async(stream, hidden_in->data, step.hidden->data, 2 * hidden_bytes);
+                ggml_backend_tensor_get_async(backend, buffers.codes, buffers.codes_host, 0,
+                                              static_cast<size_t>(codebooks) * sizeof(int32_t));
+                ggml_backend_tensor_get_async(backend, step.logits, buffers.logits, 0, 2 * logits_size * sizeof(float));
+
+                // Next frame's noise, assuming its first draw is not a pad; a pad
+                // moves the offset and the noise is recomputed above.
+                const int next = slot ^ 1;
+                const uint64_t next_offset = state.offset_blocks + first_blocks;
+                fused_depth->fill_noise(buffers.noise[next], request, state.fallback_rng, sampling_policy, next_offset);
+                noise_offset[next] = next_offset;
+                ggml_backend_synchronize(backend);
+                slot = next;
+
+                frame[0] = first_token;
+                for (int codebook = 1; codebook < codebooks; ++codebook) {
+                    const int32_t value = buffers.codes_host[codebook];
+                    if (value < 0 || value >= kCodecCodebookSize) {
+                        throw std::runtime_error(
+                            "BreezeTTS fused depth sampled an invalid token " + std::to_string(value) + " at codebook " +
+                            std::to_string(codebook));
+                    }
+                    frame[static_cast<size_t>(codebook)] = value;
+                }
+                cond_logits = buffers.logits;
+                uncond_logits = buffers.logits + logits_size;
+                state.depth_ms += engine::debug::elapsed_ms(frame_start);
+                state.codes = frame;
+                stream_audio_.push(state.codes);
+                if (capture) {
+                    captured.codes.insert(captured.codes.end(), state.codes.begin(), state.codes.end());
+                    ++captured.frames;
+                }
+            }
+        } catch (...) {
+            ggml_backend_synchronize(backend);
+            throw;
+        }
+#else
+        (void)captured;
+        (void)capture;
+        throw std::runtime_error("BreezeTTS pipelined frames need a CUDA build");
+#endif
+    }
+
     runtime::AudioBuffer generate_stream(
         const BreezeGenerationRequest & request,
         runtime::StreamingAudioConfig config,
@@ -1999,6 +2289,11 @@ struct BreezeGeneratorRuntime::Impl {
                     }
                     return audio;
                 }, std::move(sink));
+            if (pipeline_usable(*stream_)) {
+                stream_->ar_total_ms += engine::debug::measure_ms([&] {
+                    run_pipelined_frames(captured, generated_codes != nullptr);
+                });
+            }
             while (!stream_->done) {
                 int status;
                 stream_->ar_total_ms += engine::debug::measure_ms([&] { status = step_frame_once(); });
@@ -2241,6 +2536,7 @@ struct BreezeGeneratorRuntime::Impl {
     std::vector<float> depth_uncond_hidden_now_;
     std::vector<float> backbone_pair_input_;
     bool backbone_batched_cfg = false;
+    bool pipelined_frames = false;
     bool weights_released = false;
     bool backbone_batched_active = false;
 };

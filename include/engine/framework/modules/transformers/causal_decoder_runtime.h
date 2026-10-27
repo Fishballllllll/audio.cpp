@@ -59,6 +59,12 @@ struct CausalDecoderBatchedPrefillResult {
     runtime::TransformerBatchedKVState state;
 };
 
+// Device outputs of a queued batched decode step (see enqueue_batched_decode_step).
+struct CausalDecoderBatchedStepTensors {
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * hidden = nullptr;
+};
+
 struct CausalDecoderStepResult {
     std::vector<float> logits;
     std::vector<float> hidden;
@@ -132,6 +138,14 @@ public:
         const runtime::TransformerBatchedKVState & state,
         int64_t required_cache_steps);
     CausalDecoderStepResult decode_tokens_batched(const std::vector<int32_t> & tokens);
+    // Embedding input ([hidden, batch] f32 on the backend) of the started
+    // batched embedding decode graph.
+    ggml_tensor * batched_decode_embedding_input();
+    // decode_embeddings_batched without the host round trip: the embeddings are
+    // already in batched_decode_embedding_input() (written on the backend
+    // stream), the step is only queued, and the caller synchronizes the backend
+    // before reading the returned tensors. Requires no readback rounding.
+    CausalDecoderBatchedStepTensors enqueue_batched_decode_step();
     CausalDecoderStepResult decode_embeddings_batched(
         const std::vector<float> & embeddings,
         int64_t batch_size);

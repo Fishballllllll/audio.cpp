@@ -639,6 +639,25 @@ ggml_status compute_backend_graph(
         : ggml_backend_graph_compute(backend, graph);
 }
 
+ggml_status compute_backend_graph_async(ggml_backend_t backend, ggml_cgraph * graph, const char * label) {
+    if (backend == nullptr || graph == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    if (g_weight_buffers_moved.load(std::memory_order_acquire)) {
+        repoint_graph_views(graph);
+    }
+#ifndef NDEBUG
+    if (backend_graph_validation_enabled()) {
+        validate_backend_graph_supported(backend, graph, label);
+    } else {
+        (void)label;
+    }
+#else
+    (void)label;
+#endif
+    return ggml_backend_graph_compute_async(backend, graph);
+}
+
 void prepare_host_graph_plan(const ExecutionContext & execution_context, ggml_cgraph * graph, HostGraphPlan & plan) {
     plan.reset();
     if (!execution_context.uses_host_graph_plan()) {
