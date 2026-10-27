@@ -1483,9 +1483,14 @@ struct BreezeGeneratorRuntime::Impl {
             codec_storage_type,
             codec_storage_type,
             attention_preference);
+        // Pipelined frames decode streaming audio on a second CUDA backend (its own
+        // stream) so a chunk's codec work overlaps the next frame's decode.
+        if (pipelined_frames) {
+            codec_execution = std::make_unique<core::ExecutionContext>(execution.config());
+        }
         speech_decoder = std::make_unique<BreezeSpeechDecoderRuntime>(
             this->assets,
-            execution,
+            codec_execution != nullptr ? *codec_execution : execution,
             graph_arena_bytes,
             weight_context_bytes,
             std::getenv("TMP_DEC_NATIVE") ? assets::TensorStorageType::Native : codec_storage_type, // TMPDIAG
@@ -2158,6 +2163,20 @@ struct BreezeGeneratorRuntime::Impl {
             embed.tokens[codebook] = static_cast<const int32_t *>(tokens_out[static_cast<size_t>(codebook - 1)]->data);
         }
         std::vector<int32_t> frame(static_cast<size_t>(codebooks));
+        // A finished frame's codes go to the codec after the next frame is queued, so
+        // the codec (on its own backend) runs while the device decodes that frame.
+        bool has_pending = false;
+        const auto push_pending = [&] {
+            if (!has_pending) {
+                return;
+            }
+            has_pending = false;
+            stream_audio_.push(state.codes);
+            if (capture) {
+                captured.codes.insert(captured.codes.end(), state.codes.begin(), state.codes.end());
+                ++captured.frames;
+            }
+        };
         try {
             while (true) {
                 if (state.done || state.steps_taken >= request.max_tokens) {
@@ -2223,6 +2242,7 @@ struct BreezeGeneratorRuntime::Impl {
                 ggml_backend_tensor_get_async(backend, buffers.codes, buffers.codes_host, 0,
                                               static_cast<size_t>(codebooks) * sizeof(int32_t));
                 ggml_backend_tensor_get_async(backend, step.logits, buffers.logits, 0, 2 * logits_size * sizeof(float));
+                push_pending();
 
                 // Next frame's noise, assuming its first draw is not a pad; a pad
                 // moves the offset and the noise is recomputed above.
@@ -2247,12 +2267,9 @@ struct BreezeGeneratorRuntime::Impl {
                 uncond_logits = buffers.logits + logits_size;
                 state.depth_ms += engine::debug::elapsed_ms(frame_start);
                 state.codes = frame;
-                stream_audio_.push(state.codes);
-                if (capture) {
-                    captured.codes.insert(captured.codes.end(), state.codes.begin(), state.codes.end());
-                    ++captured.frames;
-                }
+                has_pending = true;
             }
+            push_pending();
         } catch (...) {
             ggml_backend_synchronize(backend);
             throw;
@@ -2524,6 +2541,7 @@ struct BreezeGeneratorRuntime::Impl {
     std::unique_ptr<BreezeFusedDepthRuntime> fused_depth;
     bool direct_prefill = false;
     std::unique_ptr<BreezeSpeechEncoderRuntime> speech_encoder;
+    std::unique_ptr<core::ExecutionContext> codec_execution;  // declared first: outlives speech_decoder
     std::unique_ptr<BreezeSpeechDecoderRuntime> speech_decoder;
     runtime::StreamingAudioController<int32_t> stream_audio_;
     std::vector<float> depth_first_embed_staging_;

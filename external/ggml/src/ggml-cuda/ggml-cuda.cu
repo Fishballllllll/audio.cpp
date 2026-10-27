@@ -4346,6 +4346,28 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
                 // Element-wise: an exact alias of an input is safe, a shifted overlap is not.
                 (!ggml_cuda_ranges_overlap(dst, x) || dst->data == x->data) &&
                 (!ggml_cuda_ranges_overlap(dst, other) || dst->data == other->data)) {
+                // The residual usually feeds the next RMS_NORM -> MUL -> ROUND directly: compute
+                // it inside that kernel's first pass (it is still stored for later layers).
+                static const bool no_residual_norm = getenv("GGML_CUDA_NO_RESIDUAL_NORM_FUSION") != nullptr;
+                if (!no_residual_norm && i + 5 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_RMS_NORM &&
+                    cgraph->nodes[i + 3]->src[0] == dst && ggml_is_contiguous(dst) &&
+                    ggml_cuda_can_fuse(cgraph, i + 3, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+                    ggml_cuda_is_elidable(cgraph, i + 4) && ggml_cuda_is_round_bf16_of(cgraph, i + 5, cgraph->nodes[i + 4])) {
+                    ggml_tensor * out = cgraph->nodes[i + 5];
+                    // Rows are normalized block by block after the residual pass, so the output may
+                    // only alias an input exactly (same row, same thread), never partially.
+                    const auto same_or_apart = [out](const ggml_tensor * t) {
+                        return !ggml_cuda_ranges_overlap(out, t) || (out->data == t->data && ggml_nbytes(out) == ggml_nbytes(t));
+                    };
+                    const int outputs[] = { i + 5 };
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i + 3, 3, outputs, 1) && ggml_is_contiguous(out) &&
+                        ggml_nelements(out) == ggml_nelements(dst) && same_or_apart(x) && same_or_apart(other) &&
+                        same_or_apart(dst)) {
+                        ggml_cuda_op_round_add_round_rms_norm_fused(*cuda_ctx, x, other, x_first, dst,
+                                                                    cgraph->nodes[i + 3], cgraph->nodes[i + 4], out);
+                        return 5;
+                    }
+                }
                 ggml_cuda_op_round_add_round_bf16(*cuda_ctx, x, other, x_first, dst);
                 return 2;
             }

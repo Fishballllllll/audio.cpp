@@ -638,8 +638,11 @@ DecoderLayerOutputs DecoderLayerModule::build(
                 attention_prefix_value->shape,
                 v.type);
         }
-        all_k = ConcatModule({1}).build(ctx, *attention_prefix_key, k);
-        all_v = ConcatModule({1}).build(ctx, *attention_prefix_value, v);
+        // The f16 K/V carried step to step (flash_kv_f16) is contiguous, so CUDA can copy
+        // every batch row in one launch instead of one per row; a copy either way.
+        const ConcatConfig concat{1, config_.runtime.attention.flash_kv_f16};
+        all_k = ConcatModule(concat).build(ctx, *attention_prefix_key, k);
+        all_v = ConcatModule(concat).build(ctx, *attention_prefix_value, v);
     }
     core::TensorValue context;
     if (allow_flash && !prefix_key.has_value() && attention_mask.has_value() &&
