@@ -1,4 +1,9 @@
+#include <cstdlib> // TMPDIAG
 #include "engine/models/breeze_tts/generator.h"
+
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+#include "cuda_depth.h"
+#endif
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -804,7 +809,8 @@ public:
         int threads,
         const BreezeTTSConfig & config,
         const modules::CausalDecoderRuntimeConfig & depth_runtime_config,
-        const BreezeWeights & weights)
+        const BreezeWeights & weights,
+        bool cuda_depth = false)
         : backend_(backend),
           backend_type_(backend_type),
           threads_(std::max(1, threads)),
@@ -824,6 +830,12 @@ public:
         if (hidden_config_.stack.runtime.attention.prefill_mode == modules::DecoderAttentionMode::FlashGroupedViewKV) {
             hidden_config_.stack.runtime.attention.prefix_mode = modules::DecoderPrefixAttentionMode::FlashWithPrefix;
         }
+        // Cached codebook steps run one row per layer, so the packed QKV can be rounded once.
+        hidden_config_.stack.activation_cast.round_packed_qkv = getenv("TMP_NO12") == nullptr; // TMPDIAG
+        // CUDA flash attention converts f32 K/V to f16 on every call; keep the in-graph
+        // K/V state in f16 instead (same values, no per-step conversion of the prefix).
+        hidden_config_.stack.runtime.attention.flash_kv_f16 =
+            backend_type_ == core::BackendType::Cuda && getenv("TMP_NO_KV_F16") == nullptr; // TMPDIAG env
         hidden_weights_.stack = weights.depth.stack;
         hidden_weights_.final_norm = weights.depth.final_norm;
         // The CPU path embeds from the f32 table. Reuse the device copy when it
@@ -838,6 +850,9 @@ public:
             store_.upload();
         }
         engine::debug::trace_log_scalar("breeze_tts.fused_depth.shared_embedding", weights.token_embedding_exact);
+        if (cuda_depth) {
+            create_cuda_depth();
+        }
     }
 
     void release_weights() {
@@ -871,7 +886,7 @@ public:
             request.depth_temperature,
             candidates_for(request.top_k),
             request.top_p};
-        if (graph_ == nullptr || !(key == key_)) {
+        if (!built_ || !(key == key_)) {
             build(key);
         }
         const size_t hidden_bytes = static_cast<size_t>(config_.hidden_size) * sizeof(float);
@@ -908,6 +923,35 @@ public:
             }
         }
         ggml_backend_tensor_set(noise_in_, noise_staging_.data(), 0, noise_staging_.size() * sizeof(float));
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        if (cuda_depth_ != nullptr) {
+            BreezeCudaDepthSampling sampling;
+            sampling.batch = key.batch;
+            sampling.guidance = key.guidance;
+            sampling.temperature = key.temperature;
+            sampling.candidates = key.candidates;
+            sampling.top_p = key.top_p;
+            const auto tokens = cuda_depth_->run(
+                core::backend_cuda_stream(backend_),
+                sampling,
+                static_cast<const float *>(hidden_in_->data),
+                static_cast<const int32_t *>(first_token_in_->data),
+                static_cast<const float *>(noise_in_->data));
+            std::vector<int32_t> frame;
+            frame.reserve(static_cast<size_t>(config_.num_codebooks));
+            frame.push_back(first_token);
+            for (const int32_t value : tokens) {
+                if (value < 0 || value >= kCodecCodebookSize) {
+                    throw std::runtime_error("BreezeTTS CUDA depth sampled an invalid token " + std::to_string(value));
+                }
+                frame.push_back(value);
+            }
+            if (getenv("TMP_DEPTH_CMP") == nullptr) { // TMPDIAG
+                return frame;
+            }
+            cmp_cuda_ = frame; // TMPDIAG
+        }
+#endif
         core::set_backend_threads(backend_, threads_);
         if (core::compute_backend_graph(backend_, graph_, nullptr, "breeze_tts.fused_depth") != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("BreezeTTS fused depth graph compute failed");
@@ -916,6 +960,16 @@ public:
         std::vector<int32_t> frame;
         frame.reserve(static_cast<size_t>(config_.num_codebooks));
         frame.push_back(first_token);
+        struct CmpReport { // TMPDIAG
+            int64_t frames = 0, same = 0, first_diff[32] = {0};
+            ~CmpReport() {
+                if (frames == 0) return;
+                fprintf(stderr, "TMPDIAG depth cmp frames=%lld identical=%lld first-diff-codebook:", (long long) frames, (long long) same);
+                for (int i = 1; i < 16; ++i) fprintf(stderr, " %lld", (long long) first_diff[i]);
+                fprintf(stderr, "\n");
+            }
+        };
+        static CmpReport report; // TMPDIAG
         for (auto * token : tokens_out_) {
             int32_t value = 0;
             ggml_backend_tensor_get(token, &value, 0, sizeof(int32_t));
@@ -926,10 +980,101 @@ public:
             }
             frame.push_back(value);
         }
+        if (!cmp_cuda_.empty()) { // TMPDIAG
+            ++report.frames;
+            size_t i = 0;
+            while (i < frame.size() && frame[i] == cmp_cuda_[i]) ++i;
+            if (i == frame.size()) ++report.same; else ++report.first_diff[i];
+            cmp_cuda_.clear();
+        }
         return frame;
     }
 
 private:
+    std::vector<int32_t> cmp_cuda_; // TMPDIAG
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+    static BreezeCudaDepthMatrix cuda_matrix(const core::TensorValue & value) {
+        BreezeCudaDepthMatrix m;
+        m.data = value.tensor->data;
+        m.row_bytes = value.tensor->nb[1];
+        m.type = static_cast<int>(value.tensor->type);
+        m.cols = value.tensor->ne[0];
+        m.rows = value.tensor->ne[1];
+        return m;
+    }
+
+    static const float * cuda_norm(const modules::NormWeights & norm) {
+        if (!norm.weight.has_value() || norm.bias.has_value() || norm.weight->tensor->type != GGML_TYPE_F32) {
+            throw std::runtime_error("unsupported depth norm");
+        }
+        return static_cast<const float *>(norm.weight->tensor->data);
+    }
+#endif
+
+    void create_cuda_depth() {
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        try {
+            BreezeCudaDepthDesc desc;
+            desc.hidden = config_.hidden_size;
+            desc.depth_hidden = config_.depth_hidden_size;
+            desc.heads = config_.depth_heads;
+            desc.kv_heads = config_.depth_kv_heads;
+            desc.head_dim = config_.depth_head_dim;
+            desc.intermediate = config_.depth_intermediate_size;
+            desc.vocab = config_.vocab_size;
+            desc.codebook_size = kCodecCodebookSize;
+            desc.steps = config_.num_codebooks - 1;
+            desc.rms_norm_eps = config_.depth_rms_norm_eps;
+            desc.rope_theta = config_.depth_rope_theta;
+            if (projector_.bias.has_value()) {
+                throw std::runtime_error("depth projector bias");
+            }
+            desc.projector = cuda_matrix(projector_.weight);
+            desc.table = cuda_matrix(table_);
+            desc.heads_w = cuda_matrix(heads_);
+            desc.head_step_bytes = heads_.tensor->nb[2];
+            desc.final_norm = cuda_norm(hidden_weights_.final_norm);
+            for (const auto & layer : hidden_weights_.stack.layers) {
+                const auto & attention = layer.self_attention;
+                if (!attention.qkv_weight.has_value() || attention.qkv_bias.has_value() || attention.out_bias.has_value() ||
+                    !layer.mlp.gate_up_proj.has_value() || layer.mlp.gate_up_proj->bias.has_value() ||
+                    layer.mlp.down_proj.bias.has_value() ||
+                    (layer.rope_frequency_factors.has_value() &&
+                     layer.rope_frequency_factors->tensor->type != GGML_TYPE_F32)) {
+                    throw std::runtime_error("unsupported depth layer layout");
+                }
+                BreezeCudaDepthLayer out;
+                out.input_norm = cuda_norm(layer.input_norm);
+                out.post_norm = cuda_norm(layer.post_norm);
+                if (layer.rope_frequency_factors.has_value()) {
+                    out.rope_factors = static_cast<const float *>(layer.rope_frequency_factors->tensor->data);
+                }
+                out.qkv = cuda_matrix(*attention.qkv_weight);
+                out.o = cuda_matrix(attention.out_weight);
+                out.gate_up = cuda_matrix(layer.mlp.gate_up_proj->weight);
+                out.down = cuda_matrix(layer.mlp.down_proj.weight);
+                desc.layers.push_back(out);
+            }
+            cuda_depth_ = BreezeCudaDepth::create(desc);
+        } catch (const std::exception & error) {
+            // Unsupported weight types or layouts keep the ggml graph.
+            engine::debug::trace_log_scalar("breeze_tts.cuda_depth.fallback", std::string_view(error.what()));
+            fprintf(stderr, "TMPDIAG cuda_depth fallback: %s\n", error.what()); // TMPDIAG
+            cuda_depth_.reset();
+        }
+#endif
+        engine::debug::trace_log_scalar("breeze_tts.cuda_depth", cuda_depth_active());
+        fprintf(stderr, "TMPDIAG cuda_depth active=%d\n", cuda_depth_active() ? 1 : 0); // TMPDIAG
+    }
+
+    bool cuda_depth_active() const {
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        return cuda_depth_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
     struct Key {
         int64_t batch = 0;
         float guidance = 1.0F;
@@ -944,6 +1089,7 @@ private:
     };
 
     void release() {
+        built_ = false;
         if (graph_ != nullptr) {
             core::release_backend_graph_resources(backend_, graph_);
             graph_ = nullptr;
@@ -1009,6 +1155,14 @@ private:
             ggml_backend_tensor_set(open_masks_in_[static_cast<size_t>(length - 2)], open.data(), 0, open.size() * sizeof(ggml_fp16_t));
         }
         noise_staging_.assign(static_cast<size_t>(kCodecCodebookSize * steps), 0.0F);
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+        if (cuda_depth_ != nullptr && getenv("TMP_DEPTH_CMP") == nullptr) { // TMPDIAG
+            // The hand-written kernels only read the uploaded inputs.
+            key_ = key;
+            built_ = true;
+            return;
+        }
+#endif
 
         graph_ctx_.reset(ggml_init({graph_arena_bytes_, nullptr, true}));
         if (graph_ctx_ == nullptr) {
@@ -1068,11 +1222,22 @@ private:
                 for (size_t layer = 0; layer < state->layers.size(); ++layer) {
                     auto & full = state->layers[layer];
                     const auto & added = out.state.layers[layer];
-                    full.key = modules::ConcatModule({1}).build(ctx, *full.key, *added.key);
-                    full.value = modules::ConcatModule({1}).build(ctx, *full.value, *added.value);
+                    // The layer already concatenated prefix + new K/V for attention; reuse it.
+                    static const bool tmp_no12 = getenv("TMP_NO12") != nullptr; // TMPDIAG
+                    full.key = (added.attended_key && !tmp_no12) ? *added.attended_key
+                                                  : modules::ConcatModule({1}).build(ctx, *full.key, *added.key);
+                    full.value = (added.attended_value && !tmp_no12)
+                                     ? *added.attended_value
+                                     : modules::ConcatModule({1}).build(ctx, *full.value, *added.value);
                 }
             }
-            auto * last = ggml_reshape_2d(g, ggml_cont(g, out.hidden.tensor), depth_hidden, batch);
+            // Cached steps already produce a contiguous row per batch; only the
+            // first step's last position needs a copy.
+            ggml_tensor * hidden_rows = out.hidden.tensor;
+            if (!ggml_is_contiguous(hidden_rows)) {
+                hidden_rows = ggml_cont(g, hidden_rows);
+            }
+            auto * last = ggml_reshape_2d(g, hidden_rows, depth_hidden, batch);
             auto head = core::wrap_tensor(
                 ggml_view_2d(g, heads_.tensor, depth_hidden, vocab, head_row, static_cast<size_t>(codebook - 1) * head_stride),
                 core::TensorShape::from_dims({vocab, depth_hidden}),
@@ -1126,6 +1291,7 @@ private:
             throw std::runtime_error("failed to allocate BreezeTTS fused depth graph");
         }
         key_ = key;
+        built_ = true;
         engine::debug::trace_log_scalar("breeze_tts.fused_depth.graph_nodes", static_cast<int64_t>(ggml_graph_n_nodes(graph_)));
     }
 
@@ -1156,6 +1322,10 @@ private:
     std::vector<ggml_tensor *> tokens_out_;
     std::vector<float> noise_staging_;
     Key key_;
+    bool built_ = false;
+#if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
+    std::unique_ptr<BreezeCudaDepth> cuda_depth_;
+#endif
 };
 
 }  // namespace
@@ -1214,7 +1384,8 @@ struct BreezeGeneratorRuntime::Impl {
                 execution.config().threads,
                 config,
                 depth_runtime_config,
-                *weights);
+                *weights,
+                perf.cuda_depth);
         } else {
             // The fused graph replaces the per-codebook depth runtimes entirely.
             depth_pair = std::make_unique<modules::CausalDecoderRuntime>(execution, depth_runtime_config, weights->depth);
@@ -1230,20 +1401,21 @@ struct BreezeGeneratorRuntime::Impl {
         engine::debug::trace_log_scalar("breeze_tts.fused_depth", fused_depth != nullptr);
         backbone_batched_cfg = cuda && perf.batched_cfg;
         engine::debug::trace_log_scalar("breeze_tts.backbone_batched_cfg", backbone_batched_cfg);
+        const auto codec_storage_type = std::getenv("TMP_CODEC_NATIVE") ? assets::TensorStorageType::Native : storage_type; // TMPDIAG
         speech_encoder = std::make_unique<BreezeSpeechEncoderRuntime>(
             this->assets,
             execution,
             graph_arena_bytes,
-            storage_type,
-            storage_type,
+            codec_storage_type,
+            codec_storage_type,
             attention_preference);
         speech_decoder = std::make_unique<BreezeSpeechDecoderRuntime>(
             this->assets,
             execution,
             graph_arena_bytes,
             weight_context_bytes,
-            storage_type,
-            storage_type,
+            std::getenv("TMP_DEC_NATIVE") ? assets::TensorStorageType::Native : codec_storage_type, // TMPDIAG
+            std::getenv("TMP_DEC_NATIVE") ? assets::TensorStorageType::Native : codec_storage_type, // TMPDIAG
             attention_preference);
         depth_first_embed_staging_.assign(static_cast<size_t>(config.depth_hidden_size), 0.0F);
         depth_projected_pair_staging_.assign(static_cast<size_t>(2 * config.depth_hidden_size), 0.0F);
@@ -1459,6 +1631,13 @@ struct BreezeGeneratorRuntime::Impl {
                 if (sampling_policy.cuda_fast_path) {
                     offset_blocks += sampling::torch_cuda_tensor_iterator_offset_blocks(
                         static_cast<uint64_t>(config.vocab_size), sampling_policy);
+                }
+            }
+            if (const char * dump = getenv("TMP_DUMP_FRAMES")) { // TMPDIAG: one line of 16 codes per frame
+                if (FILE * f = fopen(dump, "a")) {
+                    for (size_t i = 0; i < frame.size(); ++i) fprintf(f, i ? " %d" : "%d", frame[i]);
+                    fprintf(f, "\n");
+                    fclose(f);
                 }
             }
             return frame;
@@ -2048,6 +2227,12 @@ engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate(
 
 BreezeSpeechCodes BreezeGeneratorRuntime::encode_reference(const engine::runtime::AudioBuffer & audio) const {
     return impl_->speech_encoder->encode(audio);
+}
+
+engine::runtime::AudioBuffer BreezeGeneratorRuntime::decode_codes_tmpdiag(const BreezeSpeechCodes & codes) { // TMPDIAG
+    auto audio = impl_->speech_decoder->decode(codes);
+    impl_->speech_decoder->release_runtime_graphs();
+    return audio;
 }
 
 engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate_stream(

@@ -591,6 +591,11 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+            if constexpr (has_fusion) {
+                if (fusion.round_bf16) {
+                    result = __bfloat162float(__float2bfloat16(result));
+                }
+            }
             dst[j*stride_col_dst + threadIdx.x] = result;
         }
     }
@@ -685,7 +690,7 @@ static void mul_mat_vec_q_switch_fusion(
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
         const uint32_t ids_stride, cudaStream_t stream) {
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.round_bf16;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             if constexpr (type == GGML_TYPE_Q8_0) {
@@ -758,7 +763,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.round_bf16;
     const bool has_ids = ids != nullptr;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
@@ -1097,6 +1102,7 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.residual_only = fusion->residual_only;
+        fusion_local.round_bf16 = fusion->round_bf16;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

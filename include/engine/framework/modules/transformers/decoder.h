@@ -59,6 +59,9 @@ struct DecoderActivationCastPolicy {
     bool fused_round = false;
     bool after_input_norm = false;
     bool after_qkv_projection = false;
+    // With a packed QKV projection and a single row, round the packed output once
+    // instead of each of its q/k/v views (same values, two fewer kernels).
+    bool round_packed_qkv = false;
     bool after_qk_norm = false;
     bool after_rope = false;
     bool after_static_cache_update = false;
@@ -83,6 +86,11 @@ struct DecoderAttentionPolicy {
     // False routes flash branches through repeat-KV + matmul/softmax for GPUs
     // without a flash kernel (e.g. CUDA sm70). True preserves historical behavior.
     bool allow_flash_attention = true;
+    // On a flash branch, cast f32 K/V to f16 before attention. The CUDA flash kernels
+    // convert f32 K/V to f16 themselves (round to nearest even), so the values are the
+    // same; the returned K/V state is then f16 and a cached prefix is concatenated
+    // without being converted again on every step.
+    bool flash_kv_f16 = false;
 };
 
 struct DecoderStaticCachePolicy {
@@ -141,6 +149,9 @@ struct DecoderLayerOutputs {
     core::TensorValue output;
     core::TensorValue key;
     core::TensorValue value;
+    // prefix + new K/V as attended by this layer; set only when a prefix was given.
+    std::optional<core::TensorValue> attended_key;
+    std::optional<core::TensorValue> attended_value;
 };
 
 class DecoderLayerModule {
@@ -237,6 +248,8 @@ struct DecoderStackWeights {
 struct DecoderStackLayerState {
     std::optional<core::TensorValue> key;
     std::optional<core::TensorValue> value;
+    std::optional<core::TensorValue> attended_key;
+    std::optional<core::TensorValue> attended_value;
 };
 
 struct DecoderStackState {

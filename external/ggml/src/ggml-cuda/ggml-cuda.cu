@@ -41,6 +41,7 @@
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
+#include "ggml-cuda/fused-sampling.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sage-attn2.cuh"
@@ -4306,6 +4307,272 @@ static bool ggml_cuda_can_fuse_swiglu_round_bf16(const ggml_cgraph * cgraph, int
     // The fused kernel reads gate/up while writing dst; they must not alias.
     return !ggml_cuda_ranges_overlap(dst, gate) && !ggml_cuda_ranges_overlap(dst, up);
 }
+
+static bool ggml_cuda_is_metadata_op(const ggml_tensor * t) {
+    return t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+           t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+}
+
+// A ROUND_BF16 at node i folded into its only consumer. Every fused kernel evaluates the
+// same per-element expressions as the unfused nodes, so results are bit-identical:
+//  (a) ROUND(x) -> ADD -> ROUND: the residual add after a projection, one kernel.
+//  (b) ROUND(x) -> RESHAPE -> ROPE(NEOX) -> ROUND [-> PERMUTE -> CONT]: q/k sliced from a
+//      packed QKV projection; the rope kernel rounds x as it reads it and, when the result
+//      is only permuted and made contiguous, writes straight into that layout.
+//  (c) ROUND(x) -> RESHAPE -> MUL_MAT with bf16 weights on the mmf path: mmf converts its
+//      f32 input to bf16 with the same round-to-nearest-even, so it can read x directly.
+// Returns the number of nodes to skip, or 0.
+static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_ROUND_CONSUMER_FUSION") != nullptr;
+    ggml_tensor * round = cgraph->nodes[i];
+    const ggml_tensor * x = round->src[0];
+    if (disabled || round->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(round) ||
+        !ggml_cuda_is_elidable(cgraph, i) || (round->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    // (a)
+    if (i + 2 < cgraph->n_nodes) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        if (add->op == GGML_OP_ADD && (add->src[0] == round) != (add->src[1] == round) &&
+            ggml_cuda_is_elidable(cgraph, i + 1) && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_cuda_is_round_bf16_of(cgraph, i + 2, add)) {
+            const bool x_first = add->src[0] == round;
+            const ggml_tensor * other = x_first ? add->src[1] : add->src[0];
+            ggml_tensor * dst = cgraph->nodes[i + 2];
+            if (add->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
+                ggml_is_contiguous(other) && ggml_nelements(x) == ggml_nelements(round) &&
+                ggml_are_same_shape(add, round) && ggml_are_same_shape(other, add) &&
+                // Element-wise: an exact alias of an input is safe, a shifted overlap is not.
+                (!ggml_cuda_ranges_overlap(dst, x) || dst->data == x->data) &&
+                (!ggml_cuda_ranges_overlap(dst, other) || dst->data == other->data)) {
+                ggml_cuda_op_round_add_round_bf16(*cuda_ctx, x, other, x_first, dst);
+                return 2;
+            }
+        }
+    }
+
+    // (b) and (c) read the ROUND through a chain of RESHAPEs, each used once; unrelated
+    // metadata nodes (e.g. position views) may sit in between and are no-ops anyway.
+    // RESHAPE/PERMUTE are views, which ggml_node_has_n_uses() always rejects, so their
+    // own use counts are checked directly (the ROUND they view is checked above).
+    int j = i + 1;
+    const ggml_tensor * reshape = nullptr;
+    const ggml_tensor * chain_end = round;
+    for (; j < cgraph->n_nodes && j <= i + 8; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == chain_end) {
+            if (ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return 0;
+            }
+            reshape = chain_end = n;
+            continue;
+        }
+        if (ggml_cuda_is_metadata_op(n) && n->src[0] != chain_end) {
+            continue;
+        }
+        break;
+    }
+    if (reshape == nullptr || j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * consumer = cgraph->nodes[j];
+
+    // (b)
+    if (consumer->op == GGML_OP_ROPE && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F32 &&
+        ((const int32_t *) consumer->op_params)[2] == GGML_ROPE_TYPE_NEOX && ggml_is_contiguous(consumer) &&
+        ggml_cuda_is_elidable(cgraph, j) && !(consumer->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        ggml_cuda_is_round_bf16_of(cgraph, j + 1, consumer) && x->nb[0] == sizeof(float) &&
+        x->ne[0] == reshape->ne[0] * reshape->ne[1] && x->ne[1] == reshape->ne[2] && x->ne[2] == reshape->ne[3] &&
+        x->ne[3] == 1) {
+        // The rope input [d, h, t, b] is x[d + h*ne0, t, b].
+        ggml_tensor src = *reshape;
+        src.data  = x->data;
+        src.nb[0] = sizeof(float);
+        src.nb[1] = reshape->ne[0] * sizeof(float);
+        src.nb[2] = x->nb[1];
+        src.nb[3] = x->nb[2];
+        ggml_tensor * round_out = cgraph->nodes[j + 1];
+        ggml_tensor out = *round_out;
+        int last = j + 1;
+        if (j + 3 < cgraph->n_nodes && ggml_cuda_is_elidable(cgraph, j + 1) && !(round_out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * perm = cgraph->nodes[j + 2];
+            const ggml_tensor * cont = cgraph->nodes[j + 3];
+            const int32_t * axes = (const int32_t *) perm->op_params;
+            if (perm->op == GGML_OP_PERMUTE && perm->src[0] == round_out && ggml_node_get_use_count(cgraph, j + 2) == 1 &&
+                !(perm->flags & GGML_TENSOR_FLAG_OUTPUT) && axes[0] == 0 && cont->op == GGML_OP_CONT &&
+                cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
+                (cont->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                // Source dim d lands in dim axes[d] of the permute, and so of the CONT.
+                out.data = cont->data;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    out.nb[d] = cont->nb[axes[d]];
+                }
+                last = j + 3;
+            }
+            // [-> CPY(f16)]: an f16 K/V state; write the rounded values cast to f16.
+            ggml_tensor * cpy = cgraph->nodes[j + 2];
+            if (last == j + 1 && cpy->op == GGML_OP_CPY && cpy->src[0] == round_out && cpy->type == GGML_TYPE_F16 &&
+                ggml_is_contiguous(cpy) && ggml_are_same_shape(cpy, round_out) && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                out = *cpy;
+                last = j + 2;
+            }
+        }
+        const ggml_tensor * written = cgraph->nodes[last];
+        if (!ggml_cuda_ranges_overlap(written, x)) {
+            ggml_cuda_op_round_rope_round_bf16(*cuda_ctx, consumer, &src, &out);
+            return last - i;
+        }
+    }
+
+    // (d) ROUND(x) -> RESHAPE -> CPY(f16): the f16 V state, one kernel.
+    if (consumer->op == GGML_OP_CPY && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F16 &&
+        ggml_is_contiguous(consumer) && ggml_nelements(consumer) == ggml_nelements(x) && x->nb[0] == sizeof(float) &&
+        !ggml_cuda_ranges_overlap(consumer, x)) {
+        ggml_cuda_op_round_bf16_to_f16(*cuda_ctx, x, consumer);
+        return j - i;
+    }
+
+    // (c)
+    if (consumer->op == GGML_OP_MUL_MAT && consumer->src[1] == reshape && consumer->src[0]->type == GGML_TYPE_BF16 &&
+        consumer->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == ggml_nelements(round) &&
+        consumer->src[0]->buffer != nullptr && !ggml_backend_buft_is_cuda_split(consumer->src[0]->buffer->buft)) {
+        const ggml_tensor * w = consumer->src[0];
+        const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        // Only when ggml_cuda_mul_mat will pick mmf (mmvf is checked first there).
+        if (!ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, reshape->ne[1]) &&
+            ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, reshape->ne[1], /*mul_mat_id=*/false)) {
+            ggml_tensor src1 = *reshape;
+            src1.data = x->data;
+            ggml_cuda_mul_mat(*cuda_ctx, w, &src1, consumer);
+            return j - i;
+        }
+    }
+    return 0;
+}
+
+static float ggml_cuda_op_param_f32(const ggml_tensor * t, int i) {
+    float v;
+    memcpy(&v, (const float *) t->op_params + i, sizeof(float));
+    return v;
+}
+
+// Follows a chain of single-use RESHAPE views back to the tensor they view.
+static const ggml_tensor * ggml_cuda_unreshape(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// SUB(c, u) -> SCALE -> ADD(u, .) -> SCALE at node i (classifier-free guidance mix and
+// temperature of a sampling graph), as one element-wise kernel.
+static int ggml_cuda_try_fuse_cfg_scale(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * sub = cgraph->nodes[i];
+    const ggml_tensor * s1  = cgraph->nodes[i + 1];
+    const ggml_tensor * add = cgraph->nodes[i + 2];
+    ggml_tensor *       s2  = cgraph->nodes[i + 3];
+    const ggml_tensor * c = sub->src[0];
+    const ggml_tensor * u = sub->src[1];
+    if (sub->op != GGML_OP_SUB || s1->op != GGML_OP_SCALE || s1->src[0] != sub || add->op != GGML_OP_ADD ||
+        s2->op != GGML_OP_SCALE || s2->src[0] != add || !(s2->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    const bool u_first = add->src[0] == u && add->src[1] == s1;
+    if (!u_first && !(add->src[0] == s1 && add->src[1] == u)) {
+        return 0;
+    }
+    for (int idx : { i, i + 1, i + 2 }) {
+        if (!ggml_cuda_is_elidable(cgraph, idx) || (cgraph->nodes[idx]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    for (const ggml_tensor * t : { c, u, sub, s1, add, (const ggml_tensor *) s2 }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, s2)) {
+            return 0;
+        }
+    }
+    if ((ggml_cuda_ranges_overlap(s2, c) && s2->data != c->data) || (ggml_cuda_ranges_overlap(s2, u) && s2->data != u->data)) {
+        return 0;
+    }
+    ggml_cuda_op_cfg_scale_fused(*cuda_ctx, c, u, ggml_cuda_op_param_f32(s1, 0), ggml_cuda_op_param_f32(s1, 1), u_first,
+                                 ggml_cuda_op_param_f32(s2, 0), ggml_cuda_op_param_f32(s2, 1), s2);
+    return 3;
+}
+
+// CONT(order) -> GET_ROWS(scores, order), GET_ROWS(noise, order) -> ADD -> ARGMAX ->
+// GET_ROWS(order, argmax) at node i (the pick step of a top-k sampling graph), as one
+// kernel that reads the order straight from the CONT's source.
+static int ggml_cuda_try_fuse_pick_top_candidate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * cont = cgraph->nodes[i];
+    const ggml_tensor * order = cont->src[0];
+    if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_I32 || order->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(order) || ggml_nrows(cont) != 1 || (cont->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const int64_t k = cont->ne[0];
+    // The five compute nodes, in graph order, with only metadata nodes in between.
+    int idx[5];
+    int found = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16 && found < 5; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_metadata_op(n)) {
+            continue;
+        }
+        idx[found++] = j;
+    }
+    if (found < 5) {
+        return 0;
+    }
+    const ggml_tensor * gv  = cgraph->nodes[idx[0]];
+    const ggml_tensor * gn  = cgraph->nodes[idx[1]];
+    const ggml_tensor * add = cgraph->nodes[idx[2]];
+    const ggml_tensor * am  = cgraph->nodes[idx[3]];
+    ggml_tensor *       tok = cgraph->nodes[idx[4]];
+    if (gv->op != GGML_OP_GET_ROWS || gv->src[1] != cont || gn->op != GGML_OP_GET_ROWS || gn->src[1] != cont ||
+        add->op != GGML_OP_ADD || am->op != GGML_OP_ARGMAX || am->src[0] != add || tok->op != GGML_OP_GET_ROWS ||
+        tok->src[1] != am || ggml_cuda_unreshape(tok->src[0]) != cont || tok->type != GGML_TYPE_I32 ||
+        !(tok->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    const ggml_tensor * a0 = ggml_cuda_unreshape(add->src[0]);
+    const ggml_tensor * a1 = ggml_cuda_unreshape(add->src[1]);
+    const bool values_first = a0 == gv && a1 == gn;
+    if (!values_first && !(a0 == gn && a1 == gv)) {
+        return 0;
+    }
+    const ggml_tensor * scores = gv->src[0];
+    const ggml_tensor * noise  = gn->src[0];
+    if (scores->type != GGML_TYPE_F32 || noise->type != GGML_TYPE_F32 || gv->type != GGML_TYPE_F32 ||
+        gn->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || scores->ne[0] != 1 || noise->ne[0] != 1 ||
+        ggml_nrows(scores) != scores->ne[1] || ggml_nrows(noise) != noise->ne[1] || gv->ne[1] != k || gn->ne[1] != k ||
+        ggml_nelements(add) != k || ggml_nelements(tok) != 1) {
+        return 0;
+    }
+    // Every intermediate is consumed only inside the chain: the CONT by gv, gn and the
+    // reshape feeding tok; gv/gn by their reshapes; the reshapes once each.
+    if (ggml_node_get_use_count(cgraph, i) != 3 || !ggml_cuda_is_elidable(cgraph, idx[0]) ||
+        !ggml_cuda_is_elidable(cgraph, idx[1]) || !ggml_cuda_is_elidable(cgraph, idx[2]) ||
+        !ggml_cuda_is_elidable(cgraph, idx[3])) {
+        return 0;
+    }
+    for (int j = i + 1; j < idx[4]; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE && (n->src[0] == cont || n->src[0] == gv || n->src[0] == gn) &&
+            ggml_node_get_use_count(cgraph, j) != 1) {
+            return 0;
+        }
+        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    ggml_cuda_op_pick_top_candidate(*cuda_ctx, scores, noise, (const int32_t *) order->data, k, values_first, tok);
+    return idx[4] - i;
+}
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4385,6 +4652,86 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_get_unary_op(node) == GGML_UNARY_OP_ROUND_BF16 && ggml_cuda_can_fuse_swiglu_round_bf16(cgraph, i)) {
         ggml_cuda_op_swiglu_round_bf16(*cuda_ctx, node->src[0], cgraph->nodes[i + 3], cgraph->nodes[i + 6]);
         return 6;
+    }
+    if (cuda_ctx->round_bf16_fusion && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ROUND_BF16) {
+        const int skip = ggml_cuda_try_fuse_round_consumer(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+    static const bool no_sampling_fusion = getenv("GGML_CUDA_NO_SAMPLING_FUSION") != nullptr;
+    if (cuda_ctx->round_bf16_fusion && !no_sampling_fusion && node->op == GGML_OP_SUB) {
+        const int skip = ggml_cuda_try_fuse_cfg_scale(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+    if (cuda_ctx->round_bf16_fusion && !no_sampling_fusion && node->op == GGML_OP_CONT && node->type == GGML_TYPE_I32) {
+        const int skip = ggml_cuda_try_fuse_pick_top_candidate(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+    static const bool tmp_no3 = getenv("TMP_NO3") != nullptr; // TMPDIAG
+    if (!tmp_no3 && cuda_ctx->round_bf16_fusion && node->op == GGML_OP_ROPE && ggml_cuda_is_elidable(cgraph, i) &&
+        ggml_cuda_is_round_bf16_of(cgraph, i + 1, node) && node->type == GGML_TYPE_F32 &&
+        node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node)) {
+        const int mode = ((const int32_t *) node->op_params)[2];
+        const int outputs[] = { i + 1 };
+        if ((mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1) &&
+            // Each thread reads and writes the same element pair: an exact alias is safe.
+            (!ggml_cuda_ranges_overlap(cgraph->nodes[i + 1], node->src[0]) ||
+             (cgraph->nodes[i + 1]->data == node->src[0]->data && ggml_is_contiguous(node->src[0])))) {
+            ggml_cuda_op_rope_round_bf16(*cuda_ctx, node, cgraph->nodes[i + 1]);
+            return 1;
+        }
+    }
+    // MUL_MAT [+ bias ADD] [+ RESHAPE] -> ROUND_BF16 as a single mat-vec kernel.
+    if (!tmp_no3 && cuda_ctx->round_bf16_fusion && node->op == GGML_OP_MUL_MAT && ggml_cuda_is_elidable(cgraph, i)) {
+        const ggml_tensor * bias = nullptr;
+        int round_idx = i + 1;
+        if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ADD && ggml_cuda_is_elidable(cgraph, i + 1)) {
+            const ggml_tensor * add = cgraph->nodes[i + 1];
+            const ggml_tensor * other = add->src[0] == node ? add->src[1] : add->src[1] == node ? add->src[0] : nullptr;
+            if (other != nullptr && other->type == GGML_TYPE_F32 && ggml_are_same_shape(add->src[0], add->src[1])) {
+                bias = other;
+                round_idx = i + 2;
+            }
+        }
+        const ggml_tensor * pre_round = bias != nullptr ? cgraph->nodes[i + 1] : node;
+        // Linear modules reshape the projection before the rounding; the reshape is metadata only.
+        if (round_idx + 1 < cgraph->n_nodes && cgraph->nodes[round_idx]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[round_idx]->src[0] == pre_round && ggml_node_get_use_count(cgraph, round_idx) == 1 &&
+            !(cgraph->nodes[round_idx]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            pre_round = cgraph->nodes[round_idx];
+            round_idx += 1;
+        }
+        ggml_tensor * round = round_idx < cgraph->n_nodes ? cgraph->nodes[round_idx] : nullptr;
+        if (ggml_cuda_is_round_bf16_of(cgraph, round_idx, pre_round) && ggml_is_contiguous(node) &&
+            ggml_nelements(node) == ggml_nelements(round) &&
+            // Only the weights, the input vector and the bias are read from outside the
+            // elided chain. The allocator often recycles the input vector for the rounded
+            // output; that is safe for MMVQ, which reads its own q8_1 copy of the input.
+            !ggml_cuda_ranges_overlap(round, node->src[0]) &&
+            (bias == nullptr || !ggml_cuda_ranges_overlap(round, bias))) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias     = bias;
+            fusion_data.round_bf16 = true;
+            // Both are contiguous with the same element count, so the product's layout can
+            // be written straight into the rounding node's storage.
+            ggml_tensor dst = *node;
+            dst.data = round->data;
+            if (ggml_cuda_should_fuse_mul_mat_vec_f(node)) {
+                if (!ggml_cuda_ranges_overlap(round, node->src[1])) {
+                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, &fusion_data);
+                    return round_idx - i;
+                }
+            } else if (ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, &fusion_data);
+                return round_idx - i;
+            }
+        }
     }
 
 #endif
@@ -4954,6 +5301,55 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                // TMPDIAG begin: TMPTRACE=1 prints every executed node of the first big graph
+                {
+                    static const bool trace = getenv("TMPTRACE") != nullptr;
+                    static const ggml_cgraph * traced = nullptr;
+                    if (trace && cgraph->n_nodes > 2000 && (traced == nullptr || traced == cgraph)) {
+                        traced = cgraph;
+                        static int lines = 0;
+                        if (lines < 20000) {
+                            ++lines;
+                            auto desc = [](const ggml_tensor * t) {
+                                char buf[160];
+                                if (t == nullptr) return std::string("-");
+                                snprintf(buf, sizeof(buf), "%s:%s[%lld,%lld,%lld,%lld]%s", ggml_op_desc(t), ggml_type_name(t->type),
+                                         (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                                         ggml_is_contiguous(t) ? "" : "nc");
+                                return std::string(buf);
+                            };
+                            std::string fused;
+                            for (int j = 1; j <= nodes_to_skip; ++j) fused += std::string(" +") + ggml_op_desc(cgraph->nodes[i + j]);
+                            fprintf(stderr, "TRACE %5d %s%s | %s | %s | %s\n", i, desc(node).c_str(), fused.c_str(),
+                                    desc(node->src[0]).c_str(), desc(node->src[1]).c_str(), desc(node->src[2]).c_str());
+                        }
+                    }
+                }
+                {
+                    static const bool diag = getenv("TMPDIAG") != nullptr;
+                    static int diag_graphs = 0;
+                    static std::map<std::string, int> hist;
+                    if (diag && cuda_ctx->round_bf16_fusion && diag_graphs < atoi(getenv("TMPDIAG"))) {
+                        std::string key = nodes_to_skip ? std::string("FUSED:") + ggml_op_desc(node) + "+" + std::to_string(nodes_to_skip)
+                                                        : std::string(ggml_op_desc(node));
+                        if (!nodes_to_skip && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+                            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_ROUND_BF16 && cgraph->nodes[i + 1]->src[0] == node) {
+                            key += ">ROUND";
+                        }
+                        if (!nodes_to_skip && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ROUND_BF16) {
+                            key += std::string("(src=") + ggml_op_desc(node->src[0]) + (i > 0 && cgraph->nodes[i - 1] == node->src[0] ? ",adj)" : ",far)");
+                        }
+                        hist[key]++;
+                        if (i + nodes_to_skip + 1 >= cgraph->n_nodes) {
+                            fprintf(stderr, "TMPDIAG graph n_nodes=%d\n", cgraph->n_nodes);
+                            for (auto & kv : hist) fprintf(stderr, "TMPDIAG   %5d %s\n", kv.second, kv.first.c_str());
+                            hist.clear();
+                            diag_graphs++;
+                        }
+                    }
+                }
+                // TMPDIAG end
 
                 if (nodes_to_skip != 0) {
                     i += nodes_to_skip;

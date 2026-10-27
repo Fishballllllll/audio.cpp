@@ -101,6 +101,11 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 // ADD -> ROUND_BF16 on same-shape contiguous f32 operands.
 void ggml_cuda_op_add_round_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * round_node);
 
+void ggml_cuda_op_round_add_round_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * other,
+                                       bool x_first, ggml_tensor * dst);
+
+void ggml_cuda_op_round_bf16_to_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * dst);
+
 // ROUND_BF16(gate) -> SILU -> ROUND_BF16, ROUND_BF16(up), MUL -> ROUND_BF16; gate/up may be strided views.
 void ggml_cuda_op_swiglu_round_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
                                     ggml_tensor * dst);

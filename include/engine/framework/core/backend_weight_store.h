@@ -62,6 +62,9 @@ public:
         if (buffer_ != nullptr) {
             ggml_backend_buffer_free(buffer_);
         }
+        if (snapshot_host_ != nullptr) {
+            ggml_backend_buffer_free(snapshot_host_);
+        }
     }
 
     TensorValue load_tensor(
@@ -276,17 +279,25 @@ public:
 
     // Frees the device buffer while keeping every tensor header, so graphs that
     // reference these tensors stay valid; restore() uploads the same contents
-    // into a new buffer. Tensors read from a source are read again on restore
-    // (the source must still be alive); the rest are copied to host RAM here.
+    // into a new buffer. By default every tensor is copied to host RAM here
+    // (pinned when the backend offers it), so waking does not depend on the
+    // source file still being in the page cache. AUDIOCPP_SLEEP_REREAD_SOURCE=1
+    // keeps the old behaviour: source-backed tensors are read again on restore
+    // (the source must still be alive) and only the rest are copied.
     void release() {
         if (buffer_ == nullptr || released_) {
             return;
         }
+        static const bool reread_source = std::getenv("AUDIOCPP_SLEEP_REREAD_SOURCE") != nullptr;
+        snapshot_all_ = !reread_source;
         std::unordered_set<const ggml_tensor *> reloadable;
-        for (const auto & upload : reloads_) {
-            reloadable.insert(upload.tensor->view_src != nullptr ? upload.tensor->view_src : upload.tensor);
+        if (!snapshot_all_) {
+            for (const auto & upload : reloads_) {
+                reloadable.insert(upload.tensor->view_src != nullptr ? upload.tensor->view_src : upload.tensor);
+            }
         }
         snapshots_.clear();
+        size_t total = 0;
         for (auto * tensor = ggml_get_first_tensor(ctx_.get()); tensor != nullptr;
              tensor = ggml_get_next_tensor(ctx_.get(), tensor)) {
             if (tensor->view_src != nullptr || reloadable.count(tensor) != 0) {
@@ -294,10 +305,32 @@ public:
             }
             Snapshot snapshot;
             snapshot.tensor = tensor;
-            snapshot.bytes.resize(ggml_nbytes(tensor));
-            ggml_backend_tensor_get(tensor, snapshot.bytes.data(), 0, snapshot.bytes.size());
+            snapshot.offset = total;
+            snapshot.size = ggml_nbytes(tensor);
+            total += (snapshot.size + 63) & ~size_t(63);
             snapshots_.push_back(std::move(snapshot));
         }
+        // One pinned host block for all snapshots; plain RAM if pinning fails.
+        snapshot_host_ = nullptr;
+        snapshot_ram_.clear();
+        std::byte * base = nullptr;
+        if (total != 0) {
+            if (auto * host_type = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend_))) {
+                snapshot_host_ = ggml_backend_buft_alloc_buffer(host_type, total);
+            }
+            if (snapshot_host_ != nullptr) {
+                base = static_cast<std::byte *>(ggml_backend_buffer_get_base(snapshot_host_));
+            } else {
+                snapshot_ram_.resize(total);
+                base = snapshot_ram_.data();
+            }
+        }
+        for (auto & snapshot : snapshots_) {
+            snapshot.data = base + snapshot.offset;
+            ggml_backend_tensor_get(snapshot.tensor, snapshot.data, 0, snapshot.size);
+        }
+        debug::trace_log_scalar(name_ + ".sleep_host_mb", static_cast<double>(total) / (1024.0 * 1024.0));
+        debug::trace_log_scalar(name_ + ".sleep_host_pinned", snapshot_host_ != nullptr);
         released_base_ = ggml_backend_buffer_get_base(buffer_);
         ggml_backend_buffer_free(buffer_);
         buffer_ = nullptr;
@@ -333,18 +366,26 @@ public:
         ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         debug::trace_log_scalar(name_ + ".restore_moved", ggml_backend_buffer_get_base(buffer_) != released_base_);
         note_weight_buffers_moved();
-        for (const auto & upload : reloads_) {
-            if (upload.kind == PendingUploadKind::Tensor) {
-                upload.source->set_backend_tensor(upload.tensor, upload.name, upload.storage_type, upload.expected_shape);
-            } else {
-                upload.source->set_backend_f32_tensor(upload.tensor, upload.name, upload.expected_shape);
+        if (!snapshot_all_) {
+            for (const auto & upload : reloads_) {
+                if (upload.kind == PendingUploadKind::Tensor) {
+                    upload.source->set_backend_tensor(upload.tensor, upload.name, upload.storage_type, upload.expected_shape);
+                } else {
+                    upload.source->set_backend_f32_tensor(upload.tensor, upload.name, upload.expected_shape);
+                }
             }
         }
         for (const auto & snapshot : snapshots_) {
-            ggml_backend_tensor_set(snapshot.tensor, snapshot.bytes.data(), 0, snapshot.bytes.size());
+            ggml_backend_tensor_set(snapshot.tensor, snapshot.data, 0, snapshot.size);
         }
         snapshots_.clear();
         snapshots_.shrink_to_fit();
+        if (snapshot_host_ != nullptr) {
+            ggml_backend_buffer_free(snapshot_host_);
+            snapshot_host_ = nullptr;
+        }
+        snapshot_ram_.clear();
+        snapshot_ram_.shrink_to_fit();
         released_ = false;
     }
 
@@ -375,7 +416,9 @@ private:
 
     struct Snapshot {
         ggml_tensor * tensor = nullptr;
-        std::vector<std::byte> bytes;
+        size_t offset = 0;
+        size_t size = 0;
+        std::byte * data = nullptr;
     };
 
     static TensorShape shape_from_dims(const std::vector<int64_t> & dims) {
@@ -615,6 +658,9 @@ private:
     std::vector<PendingUpload> pending_;
     std::vector<PendingUpload> reloads_;
     std::vector<Snapshot> snapshots_;
+    ggml_backend_buffer_t snapshot_host_ = nullptr;
+    std::vector<std::byte> snapshot_ram_;
+    bool snapshot_all_ = false;
     void * released_base_ = nullptr;
     bool released_ = false;
 };

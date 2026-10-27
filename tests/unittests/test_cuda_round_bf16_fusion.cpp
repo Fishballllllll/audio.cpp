@@ -11,12 +11,18 @@
 #include <vector>
 
 // Checks that the CUDA kernels which fold GGML_UNARY_OP_ROUND_BF16 into the
-// preceding op (RMS_NORM*w, residual ADD, bf16-reference SwiGLU) are bit-identical
+// preceding op (RMS_NORM*w, residual ADD, bf16-reference SwiGLU, ROPE, mat-vec
+// MUL_MAT with or without a bias ADD) are bit-identical
 // to the unfused node-by-node evaluation. Marking an intermediate as an output
 // disables the fusion, which gives the reference result on the same backend.
 
 namespace {
-enum class Pattern { RmsNormMul, Add, SwiGlu };
+enum class Pattern { RmsNormMul, Add, SwiGlu, RopeNeox, RopeNorm, MatVecF32, MatVecBf16, MatVecQ8, MatVecQ8Bias };
+
+bool is_mat_vec(Pattern pattern) {
+    return pattern == Pattern::MatVecF32 || pattern == Pattern::MatVecBf16 || pattern == Pattern::MatVecQ8 ||
+           pattern == Pattern::MatVecQ8Bias;
+}
 
 std::vector<float> values(size_t count, float scale, float phase, bool exceptional) {
     std::vector<float> out(count);
@@ -42,12 +48,26 @@ std::vector<float> run(ggml_backend_t backend, Pattern pattern, int width, int r
     ggml_context * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     if (!ctx) throw std::runtime_error("context allocation failed");
     std::vector<ggml_tensor *> inputs;
-    std::vector<std::vector<float>> data;
+    std::vector<std::vector<uint8_t>> data;
     ggml_tensor * output = nullptr;
     auto input = [&](ggml_tensor * t, float scale, float phase, bool exceptional = true) {
         ggml_set_input(t);
         inputs.push_back(t);
-        data.push_back(values(static_cast<size_t>(ggml_nelements(t)), scale, phase, exceptional));
+        const auto v = values(static_cast<size_t>(ggml_nelements(t)), scale, phase, exceptional);
+        std::vector<uint8_t> bytes(ggml_nbytes(t));
+        if (t->type == GGML_TYPE_F32) {
+            std::memcpy(bytes.data(), v.data(), bytes.size());
+        } else if (t->type == GGML_TYPE_BF16) {
+            ggml_fp32_to_bf16_row(v.data(), reinterpret_cast<ggml_bf16_t *>(bytes.data()), ggml_nelements(t));
+        } else if (t->type == GGML_TYPE_I32) {
+            for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+                const int32_t pos = static_cast<int32_t>(3 * i + 5);
+                std::memcpy(bytes.data() + i * sizeof(int32_t), &pos, sizeof(pos));
+            }
+        } else {
+            ggml_quantize_chunk(t->type, v.data(), bytes.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+        }
+        data.push_back(std::move(bytes));
         return t;
     };
     if (pattern == Pattern::RmsNormMul) {
@@ -63,6 +83,41 @@ std::vector<float> run(ggml_backend_t backend, Pattern pattern, int width, int r
         auto * sum = ggml_add(ctx, a, b);
         if (reference) ggml_set_output(sum);
         output = ggml_round_bf16(ctx, sum);
+    } else if (pattern == Pattern::RopeNeox || pattern == Pattern::RopeNorm) {
+        // width = head dim (64 takes the packed-rows norm kernel), rows = tokens.
+        const int heads = 8;
+        auto * x = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, rows), 5.0f, 0.3f);
+        auto * pos = input(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows), 0.0f, 0.0f, false);
+        const int mode = pattern == Pattern::RopeNeox ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
+        auto * rope = ggml_rope_ext(ctx, x, pos, nullptr, width, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        if (reference) ggml_set_output(rope);
+        output = ggml_round_bf16(ctx, rope);
+    } else if (is_mat_vec(pattern)) {
+        // width = output features, rows = broadcast channels; one token per channel.
+        const int k = 1024;
+        const ggml_type wtype = pattern == Pattern::MatVecF32  ? GGML_TYPE_F32
+                              : pattern == Pattern::MatVecBf16 ? GGML_TYPE_BF16
+                                                               : GGML_TYPE_Q8_0;
+        auto * w = input(ggml_new_tensor_2d(ctx, wtype, k, width), 0.05f, 0.9f, false);
+        auto * x = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, rows), 2.0f, 0.5f, false);
+        // Keep the operands alive: a mat-vec cannot write over its inputs, so recycled
+        // storage would only (correctly) disable the fusion under test.
+        ggml_set_output(w);
+        ggml_set_output(x);
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        if (pattern == Pattern::MatVecQ8Bias) {
+            if (reference) ggml_set_output(y);
+            auto * bias = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, rows), 1.0f, 2.1f, false);
+            ggml_set_output(bias);
+            y = ggml_add(ctx, y, bias);
+        }
+        if (pattern == Pattern::MatVecBf16 || pattern == Pattern::MatVecQ8Bias) {
+            // Linear modules reshape the projection before rounding it.
+            if (reference) ggml_set_output(y);
+            y = ggml_reshape_2d(ctx, y, width, rows);
+        }
+        if (reference) ggml_set_output(y);
+        output = ggml_round_bf16(ctx, y);
     } else {
         // Packed [gate | up] rows, as produced by a fused gate_up projection.
         auto * packed = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * width, rows), 6.0f, 0.4f);
@@ -81,7 +136,7 @@ std::vector<float> run(ggml_backend_t backend, Pattern pattern, int width, int r
     for (int repeat = 0; repeat < 3; ++repeat) {
         // The graph allocator may reuse input storage for intermediates.
         for (size_t i = 0; i < inputs.size(); ++i) {
-            ggml_backend_tensor_set(inputs[i], data[i].data(), 0, data[i].size() * sizeof(float));
+            ggml_backend_tensor_set(inputs[i], data[i].data(), 0, data[i].size());
         }
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("CUDA graph failed");
@@ -117,10 +172,15 @@ int main() {
         return 1;
     }
     set_fusion(backend, true);
-    const char * names[] = {"rms_norm*w", "add", "swiglu"};
+    const char * names[] = {"rms_norm*w", "add", "swiglu", "rope_neox", "rope_norm",
+                            "mat_vec_f32", "mat_vec_bf16", "mat_vec_q8_0", "mat_vec_q8_0+bias"};
     try {
-        for (Pattern pattern : {Pattern::RmsNormMul, Pattern::Add, Pattern::SwiGlu}) {
-            for (int width : {1, 17, 1024, 2048, 8192}) {
+        for (Pattern pattern : {Pattern::RmsNormMul, Pattern::Add, Pattern::SwiGlu, Pattern::RopeNeox,
+                                Pattern::RopeNorm, Pattern::MatVecF32, Pattern::MatVecBf16, Pattern::MatVecQ8,
+                                Pattern::MatVecQ8Bias}) {
+            const bool rope = pattern == Pattern::RopeNeox || pattern == Pattern::RopeNorm;
+            const std::vector<int> widths = rope ? std::vector<int>{64, 128} : std::vector<int>{1, 17, 1024, 2048, 8192};
+            for (int width : widths) {
                 for (int rows : {1, 4}) {
                     const auto reference = run(backend, pattern, width, rows, true);
                     const auto fused = run(backend, pattern, width, rows, false);
@@ -136,8 +196,9 @@ int main() {
                 }
             }
         }
-        std::cout << "PASS: bf16 rounding fused into rms_norm*w, add and swiglu; odd widths, multiple rows, "
-                     "strided gate/up views, exceptional values\n";
+        std::cout << "PASS: bf16 rounding fused into rms_norm*w, add, swiglu, rope (neox/normal) and mat-vec "
+                     "(f32/bf16/q8_0, optional bias); odd widths, multiple rows, strided gate/up views, "
+                     "exceptional values\n";
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         ggml_backend_free(backend);

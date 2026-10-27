@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio> // TMPDIAG
+#include <cstdlib> // TMPDIAG
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -88,7 +90,7 @@ constexpr PerfPreset kPerfPresets[] = {
 };
 
 // perf_mode picks the defaults; explicit options override the preset.
-BreezePerfOptions perf_options_from_options(const runtime::SessionOptions & options) {
+BreezePerfOptions perf_options_from_options(const runtime::SessionOptions & options, core::BackendType backend_type) {
     const auto perf_mode = runtime::find_option(options.options, {"breeze_tts.perf_mode"}).value_or("off");
     const auto * preset = std::find_if(std::begin(kPerfPresets), std::end(kPerfPresets),
         [&](const PerfPreset & entry) { return entry.name == perf_mode; });
@@ -106,6 +108,13 @@ BreezePerfOptions perf_options_from_options(const runtime::SessionOptions & opti
         if (const auto value = runtime::find_option(options.options, {key})) {
             perf.*member = runtime::parse_bool_option(*value, key);
         }
+    }
+    const auto exec_plan = runtime::parse_exec_plan(
+        options.options, "breeze_tts.exec_plan",
+        {{"depth", "ggml", {{"ggml", {backend_type}, {}, {}, {}}, {"cuda", {core::BackendType::Cuda}, {}, {}, {}}}}});
+    perf.cuda_depth = exec_plan.at("depth").impl == "cuda";
+    if (perf.cuda_depth && (backend_type != core::BackendType::Cuda || !perf.fused_depth)) {
+        throw std::runtime_error("breeze_tts.exec_plan depth.impl=cuda requires a CUDA session with fused_depth");
     }
     engine::debug::trace_log_scalar("breeze_tts.perf_mode", std::string_view(preset->name));
     return perf;
@@ -132,7 +141,8 @@ void validate_session_options(
     for (const char * key : {"breeze_tts.attention", "bf16_activations", "breeze_tts.bf16_activations",
                              "breeze_tts.perf_mode", "breeze_tts.fused_depth",
                              "breeze_tts.direct_prefill", "breeze_tts.skip_cache_round",
-                             "breeze_tts.round_bf16_fusion", "breeze_tts.batched_cfg"}) {
+                             "breeze_tts.round_bf16_fusion", "breeze_tts.batched_cfg",
+                             "breeze_tts.exec_plan"}) {
         if (contract.session_option_keys.find(key) == contract.session_option_keys.end()) {
             validation_options.options.erase(key);
         }
@@ -246,7 +256,7 @@ BreezeTTSSession::BreezeTTSSession(
     const auto attention_preference = attention_preference_from_options(options);
     trace_attention_preference(attention_preference);
     const auto bf16_activations = bf16_activation_mode_from_options(options);
-    const auto perf = perf_options_from_options(options);
+    const auto perf = perf_options_from_options(options, execution_context().backend_type());
     core::set_backend_round_bf16_fusion(execution_context().backend(), round_bf16_fusion_from_options(options));
     generator_ = std::make_unique<BreezeGeneratorRuntime>(
         assets_,
@@ -339,6 +349,13 @@ runtime::TaskResult BreezeTTSSession::run(const runtime::TaskRequest & request) 
         request.voice->speaker.has_value() &&
         request.voice->speaker->audio.has_value()) {
         reference_codes = resolve_reference_codes(*request.voice->speaker->audio);
+    }
+    if (std::getenv("TMP_CODEC_RT") && reference_codes.has_value()) { // TMPDIAG: reference audio -> codes -> audio
+        runtime::TaskResult rt;
+        rt.audio_output = generator_->decode_codes_tmpdiag(*reference_codes);
+        std::fprintf(stderr, "TMPDIAG codec_rt frames=%lld samples=%zu\n",
+                     static_cast<long long>(reference_codes->frames), rt.audio_output->samples.size());
+        return rt;
     }
     const bool anchor_voice = chunks.size() > 1 && !reference_codes.has_value();
     for (size_t index = 0; index < chunks.size(); ++index) {

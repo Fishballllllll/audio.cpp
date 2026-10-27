@@ -2665,6 +2665,13 @@ audiocpp_add_model(breeze_tts
     LOADERS
         engine::models::breeze_tts::make_breeze_tts_loader
 )
+if (ENGINE_ENABLE_CUDA AND NOT ENGINE_ENABLE_HIP)
+    # breeze_tts.exec_plan depth.impl=cuda: hand-written depth decoder kernels.
+    target_sources(engine_model_breeze_tts PRIVATE src/models/breeze_tts/cuda_depth.cu)
+    set_source_files_properties(src/models/breeze_tts/cuda_depth.cu PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(engine_model_breeze_tts PRIVATE ENGINE_HAS_BREEZE_CUDA_DEPTH=1)
+    target_link_libraries(engine_model_breeze_tts PRIVATE CUDA::cudart)
+endif()
 
 audiocpp_add_model(vibeasr
     SOURCES

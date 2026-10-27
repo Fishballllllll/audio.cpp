@@ -413,6 +413,69 @@ void ggml_cuda_op_add_round_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (const float *) a->data, (const float *) b->data, (float *) round_node->data, k);
 }
 
+// ROUND(x) -> ADD -> ROUND: x is rounded as it is read, then added to the other
+// operand in the ADD's own operand order.
+template <bool x_first>
+static __global__ void round_add_round_bf16_kernel(const float * x, const float * other, float * dst, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const float r = op_round_bf16(x[i]);
+    dst[i] = x_first ? op_round_bf16(r + other[i]) : op_round_bf16(other[i] + r);
+}
+
+void ggml_cuda_op_round_add_round_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * other,
+                                       bool x_first, ggml_tensor * dst) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(other) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(x) == ggml_nelements(dst) && ggml_are_same_shape(other, dst));
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    if (x_first) {
+        round_add_round_bf16_kernel<true><<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) other->data, (float *) dst->data, k);
+    } else {
+        round_add_round_bf16_kernel<false><<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) other->data, (float *) dst->data, k);
+    }
+}
+
+// ROUND(x) -> CPY(f16): x may be a strided view; dst is contiguous in x's logical order.
+static __global__ void round_bf16_to_f16_kernel(
+    const char * cx, half * dst, const int64_t k,
+    const int64_t ne0, const int64_t ne1, const int64_t ne2,
+    const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0*ne1)) % ne2;
+    const int64_t i3 = i / (ne0*ne1*ne2);
+
+    const float * x = (const float *) (cx + i1*nb01 + i2*nb02 + i3*nb03);
+    dst[i] = __float2half(op_round_bf16(x[i0]));
+}
+
+void ggml_cuda_op_round_bf16_to_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * dst) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && ggml_is_contiguous(dst) && ggml_nelements(dst) == ggml_nelements(x));
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    round_bf16_to_f16_kernel<<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const char *) x->data, (half *) dst->data, k, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], x->nb[3]);
+}
+
 // ROUND(gate) -> SILU -> ROUND, ROUND(up), MUL -> ROUND in one pass. gate and up
 // may be strided row views (e.g. the halves of a packed gate_up projection).
 static __global__ void swiglu_round_bf16_kernel(

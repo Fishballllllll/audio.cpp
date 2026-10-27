@@ -304,7 +304,8 @@ QKVProjections build_qkv_projections(
     const core::TensorValue & input,
     const DecoderLayerWeights & weights,
     const DecoderLayerConfig & config,
-    int64_t dim) {
+    int64_t dim,
+    bool round_packed = false) {
     const int64_t q_out = config.num_attention_heads * dim;
     const int64_t kv_out = config.num_key_value_heads * dim;
     if (config.qkv_layout == DecoderQKVLayout::PackedQKV) {
@@ -319,6 +320,9 @@ QKVProjections build_qkv_projections(
                            config.projection_precision,
                        })
                        .build(ctx, input, {*weights.self_attention.qkv_weight, weights.self_attention.qkv_bias});
+        if (round_packed) {
+            qkv = activation_cast(ctx, qkv, config.activation_cast);
+        }
         return {
             SliceModule({2, 0, q_out}).build(ctx, qkv),
             SliceModule({2, q_out, kv_out}).build(ctx, qkv),
@@ -555,8 +559,12 @@ DecoderLayerOutputs DecoderLayerModule::build(
     if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
-    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    const bool round_packed_qkv = config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+                                  config_.activation_cast.round_packed_qkv &&
+                                  config_.qkv_layout == DecoderQKVLayout::PackedQKV &&
+                                  x_norm.shape.dims[0] * x_norm.shape.dims[1] == 1;
+    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim, round_packed_qkv);
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !round_packed_qkv) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -599,6 +607,17 @@ DecoderLayerOutputs DecoderLayerModule::build(
         prefix_key.has_value() &&
         config_.runtime.attention.prefix_mode == DecoderPrefixAttentionMode::FlashWithPrefix &&
         config_.runtime.attention.prefill_mode == DecoderAttentionMode::FlashGroupedViewKV;
+    // Mirrors the flash branches below.
+    const bool flash_branch =
+        allow_flash && attention_mask.has_value() &&
+        (use_prefix_flash ||
+         (!prefix_key.has_value() &&
+          (config_.runtime.attention.prefill_mode == DecoderAttentionMode::FlashGroupedViewKV ||
+           config_.runtime.attention.prefill_mode == DecoderAttentionMode::FlashGrouped)));
+    if (config_.runtime.attention.flash_kv_f16 && flash_branch && k.type == GGML_TYPE_F32 && v.type == GGML_TYPE_F32) {
+        k = core::wrap_tensor(ggml_cast(ctx.ggml, k.tensor, GGML_TYPE_F16), k.shape, GGML_TYPE_F16);
+        v = core::wrap_tensor(ggml_cast(ctx.ggml, v.tensor, GGML_TYPE_F16), v.shape, GGML_TYPE_F16);
+    }
     core::TensorValue all_k = k;
     core::TensorValue all_v = v;
     // Cached prefix KV may be stored in a different dtype than the current
@@ -713,6 +732,9 @@ DecoderLayerOutputs DecoderLayerModule::build(
     if (config_.activation_cast.enabled && config_.activation_cast.after_output) {
         output = activation_cast(ctx, output, config_.activation_cast);
     }
+    if (prefix_key.has_value()) {
+        return {output, k, v, all_k, all_v};
+    }
     return {output, k, v};
 }
 
@@ -769,8 +791,12 @@ DecoderLayerOutputs DecoderLayerModule::build_static_cache_impl(
     if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
-    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    const bool round_packed_qkv = config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+                                  config_.activation_cast.round_packed_qkv &&
+                                  config_.qkv_layout == DecoderQKVLayout::PackedQKV &&
+                                  x_norm.shape.dims[0] * x_norm.shape.dims[1] == 1;
+    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim, round_packed_qkv);
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !round_packed_qkv) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -954,8 +980,12 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
     if (config_.activation_cast.enabled && config_.activation_cast.after_input_norm) {
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
-    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    const bool round_packed_qkv = config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+                                  config_.activation_cast.round_packed_qkv &&
+                                  config_.qkv_layout == DecoderQKVLayout::PackedQKV &&
+                                  x_norm.shape.dims[0] * x_norm.shape.dims[1] == 1;
+    auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim, round_packed_qkv);
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection && !round_packed_qkv) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -1139,7 +1169,7 @@ DecoderStackOutputs DecoderStackModule::build(
             layer_prefix != nullptr ? layer_prefix->value : std::nullopt,
             attention_mask);
         output = layer.output;
-        state.layers.push_back({layer.key, layer.value});
+        state.layers.push_back({layer.key, layer.value, layer.attended_key, layer.attended_value});
     }
     return {output, std::move(state)};
 }

@@ -52,6 +52,9 @@ struct BreezePerfOptions {
     bool skip_cache_round = false;
     // With CFG, decode both backbone branches as one batch-2 step.
     bool batched_cfg = false;
+    // breeze_tts.exec_plan depth.impl=cuda: run the fused depth frame with the
+    // hand-written CUDA kernels instead of the ggml graph (needs fused_depth).
+    bool cuda_depth = false;
 };
 
 class BreezeGeneratorRuntime {
@@ -71,6 +74,7 @@ public:
         const BreezeGenerationRequest & request,
         BreezeSpeechCodes * generated_codes = nullptr);
     BreezeSpeechCodes encode_reference(const engine::runtime::AudioBuffer & audio) const;
+    engine::runtime::AudioBuffer decode_codes_tmpdiag(const BreezeSpeechCodes & codes); // TMPDIAG
     engine::runtime::AudioBuffer generate_stream(
         const BreezeGenerationRequest & request,
         engine::runtime::StreamingAudioConfig config,
