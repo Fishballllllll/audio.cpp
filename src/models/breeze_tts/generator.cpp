@@ -1,4 +1,27 @@
 #include <cstdlib> // TMPDIAG
+#include <chrono> // TMPDIAG
+#include <cstdio> // TMPDIAG
+namespace { // TMPDIAG host profile: TMP_HOSTPROF=1 prints per-frame average microseconds per section
+struct TmpHostProf {
+    bool on = std::getenv("TMP_HOSTPROF") != nullptr;
+    double acc[12] = {0};
+    long long frames = 0;
+    using TP = std::chrono::steady_clock::time_point;
+    static TP now() { return std::chrono::steady_clock::now(); }
+    void add(int i, TP a) { if (on) acc[i] += std::chrono::duration<double, std::micro>(now() - a).count(); }
+    void report() {
+        if (!on || frames == 0) return;
+        static const char * n[12] = {"backbone", "mix", "sample", "dep_set", "dep_noise", "dep_noise_set",
+                                     "dep_launch", "dep_sync", "dep_get", "embed", "codec", "step_total"};
+        fprintf(stderr, "TMPDIAG hostprof frames=%lld", frames);
+        for (int i = 0; i < 12; ++i) fprintf(stderr, " %s=%.1f", n[i], acc[i] / frames);
+        fprintf(stderr, "\n");
+        for (double & x : acc) x = 0;
+        frames = 0;
+    }
+};
+TmpHostProf g_hp;
+} // namespace TMPDIAG
 #include "engine/models/breeze_tts/generator.h"
 
 #if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
@@ -890,11 +913,14 @@ public:
             build(key);
         }
         const size_t hidden_bytes = static_cast<size_t>(config_.hidden_size) * sizeof(float);
+        auto hp_set = TmpHostProf::now(); // TMPDIAG
         ggml_backend_tensor_set(hidden_in_, cond_hidden, 0, hidden_bytes);
         if (paired) {
             ggml_backend_tensor_set(hidden_in_, uncond_hidden, hidden_bytes, hidden_bytes);
         }
         ggml_backend_tensor_set(first_token_in_, &first_token, 0, sizeof(int32_t));
+        g_hp.add(3, hp_set); // TMPDIAG
+        auto hp_noise = TmpHostProf::now(); // TMPDIAG
         // Exponential race: argmax(logits / T - log E) samples softmax(logits / T).
         // With the torch CUDA policy, E is the per-codebook sampler's own draw for
         // each token, so the device picks the token it would have picked.
@@ -922,7 +948,10 @@ public:
                 value = static_cast<float>(-std::log(-std::log(uniform)));
             }
         }
+        g_hp.add(4, hp_noise); // TMPDIAG
+        auto hp_nset = TmpHostProf::now(); // TMPDIAG
         ggml_backend_tensor_set(noise_in_, noise_staging_.data(), 0, noise_staging_.size() * sizeof(float));
+        g_hp.add(5, hp_nset); // TMPDIAG
 #if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
         if (cuda_depth_ != nullptr) {
             BreezeCudaDepthSampling sampling;
@@ -953,10 +982,15 @@ public:
         }
 #endif
         core::set_backend_threads(backend_, threads_);
+        auto hp_launch = TmpHostProf::now(); // TMPDIAG
         if (core::compute_backend_graph(backend_, graph_, nullptr, "breeze_tts.fused_depth") != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("BreezeTTS fused depth graph compute failed");
         }
+        g_hp.add(6, hp_launch); // TMPDIAG
+        auto hp_sync = TmpHostProf::now(); // TMPDIAG
         ggml_backend_synchronize(backend_);
+        g_hp.add(7, hp_sync); // TMPDIAG
+        auto hp_get = TmpHostProf::now(); // TMPDIAG
         std::vector<int32_t> frame;
         frame.reserve(static_cast<size_t>(config_.num_codebooks));
         frame.push_back(first_token);
@@ -980,6 +1014,7 @@ public:
             }
             frame.push_back(value);
         }
+        g_hp.add(8, hp_get); // TMPDIAG
         if (!cmp_cuda_.empty()) { // TMPDIAG
             ++report.frames;
             size_t i = 0;
@@ -1861,13 +1896,17 @@ struct BreezeGeneratorRuntime::Impl {
         auto & state = *stream_;
         const auto & request = state.request;
         const auto & config = assets->config;
+        auto hp_step = TmpHostProf::now(); // TMPDIAG
+        struct HpStep { TmpHostProf::TP t; ~HpStep() { g_hp.add(11, t); } } hp_step_guard{hp_step}; // TMPDIAG
         if (state.done || state.steps_taken >= request.max_tokens) {
             state.done = true;
             return 2;
         }
         if (!state.pending_embedding.empty()) {
+            auto hp_bb = TmpHostProf::now(); // TMPDIAG
             decode_backbone(state.pending_embedding, state.use_cfg, state.cond, state.uncond,
                             state.backbone_cond_decode_ms, state.backbone_uncond_decode_ms);
+            g_hp.add(0, hp_bb); // TMPDIAG
             state.pending_embedding.clear();
         }
         ++state.steps_taken;
@@ -1876,6 +1915,7 @@ struct BreezeGeneratorRuntime::Impl {
                 throw std::runtime_error("BreezeTTS CFG logits shape mismatch");
             }
         }
+        auto hp_mix = TmpHostProf::now(); // TMPDIAG
         std::vector<float> logits;
         if (state.use_cfg) {
             logits.resize(state.cond.logits.size());
@@ -1887,6 +1927,8 @@ struct BreezeGeneratorRuntime::Impl {
             logits = state.cond.logits;
         }
         suppress_reserved(logits, kCodecCodebookSize, config.vocab_size);
+        g_hp.add(1, hp_mix); // TMPDIAG
+        auto hp_sample = TmpHostProf::now(); // TMPDIAG
         const int32_t first_token = sample_logits(
             std::move(logits),
             state.first_codebook_history,
@@ -1898,6 +1940,7 @@ struct BreezeGeneratorRuntime::Impl {
             state.sample_call_index,
             state.offset_blocks,
             "BreezeTTS semantic sampler");
+        g_hp.add(2, hp_sample); // TMPDIAG
         if (first_token == config.vocab_size) {
             state.done = true;
             return 2;
@@ -1919,12 +1962,15 @@ struct BreezeGeneratorRuntime::Impl {
         state.depth_ms += engine::debug::elapsed_ms(depth_start);
         state.first_codebook_history.push_back(first_token);
         state.codes = frame;
+        auto hp_embed = TmpHostProf::now(); // TMPDIAG
         state.pending_embedding = frame_embedding(
             weights->audio_embedding,
             config.num_codebooks * config.vocab_size,
             config.hidden_size,
             config.vocab_size,
             frame);
+        g_hp.add(9, hp_embed); // TMPDIAG
+        ++g_hp.frames; // TMPDIAG
         return 0;
     }
 
@@ -1957,7 +2003,9 @@ struct BreezeGeneratorRuntime::Impl {
                 int status;
                 stream_->ar_total_ms += engine::debug::measure_ms([&] { status = step_frame_once(); });
                 if (status == 0) {
+                    auto hp_codec = TmpHostProf::now(); // TMPDIAG
                     stream_audio_.push(stream_->codes);
+                    g_hp.add(10, hp_codec); // TMPDIAG
                     if (generated_codes != nullptr) {
                         captured.codes.insert(captured.codes.end(), stream_->codes.begin(), stream_->codes.end());
                         ++captured.frames;
@@ -1978,6 +2026,7 @@ struct BreezeGeneratorRuntime::Impl {
     }
 
     void end_stream() {
+        g_hp.report(); // TMPDIAG
         stream_audio_.reset();
         if (stream_ == nullptr) {
             return;
