@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <list>
 #include <stdexcept>
 #include <utility>
 
@@ -242,13 +243,30 @@ struct BreezeT5Gemma2TextEncoderRuntime::Impl {
         if (tokens <= 0) {
             throw std::runtime_error("BreezeTTS text encoder requires non-empty input");
         }
+        // The output depends only on the token ids. A clone prompt encodes the same
+        // reference text in both CFG branches, and again for every request with that
+        // voice, so recent results are reused (most recently used first).
+        for (auto it = recent.begin(); it != recent.end(); ++it) {
+            if (it->first == input_ids) {
+                recent.splice(recent.begin(), recent, it);
+                engine::debug::timing_log_scalar("breeze_tts.text_encoder.cached_ms", engine::debug::elapsed_ms(start));
+                return recent.front().second;
+            }
+        }
         if (graph == nullptr || graph->tokens != tokens) {
             graph = std::make_unique<Graph>(execution, graph_arena_bytes, assets->config, weights, tokens);
         }
         auto out = graph->run(input_ids);
+        recent.emplace_front(input_ids, out);
+        if (recent.size() > kRecentEntries) {
+            recent.pop_back();
+        }
         engine::debug::timing_log_scalar("breeze_tts.text_encoder.total_ms", engine::debug::elapsed_ms(start));
         return out;
     }
+
+    static constexpr size_t kRecentEntries = 32;
+    std::list<std::pair<std::vector<int32_t>, BreezeProjectedText>> recent;
 
     void release_runtime_graphs() {
         graph.reset();
