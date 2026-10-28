@@ -74,6 +74,10 @@ void set_backend_stream_priority(ggml_backend_t backend, int priority);
 // RMS_NORM*MUL, ADD and SwiGLU kernels (bit-identical, fewer launches). No-op
 // on other backends and on builds whose CUDA backend does not export the hook.
 void set_backend_round_bf16_fusion(ggml_backend_t backend, bool enabled);
+// Whether computing graph on backend would replay an already captured CUDA graph
+// (nothing runs op by op on the host). False on other backends and on builds
+// whose CUDA backend does not export the hook.
+bool backend_graph_is_captured(ggml_backend_t backend, ggml_cgraph * graph);
 void * backend_cuda_stream(ggml_backend_t backend);
 // evict_cuda_graph_cache=false (the default) is the historical no-op;
 // true drops the backend's cached compiled-graph state (CUDA/HIP graph

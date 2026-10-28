@@ -1055,6 +1055,11 @@ public:
     const std::vector<ggml_tensor *> & token_outputs() const { return tokens_out_; }
     const core::TensorValue & embedding_table() const { return table_; }
 
+    // Whether the next enqueue() replays a captured CUDA graph.
+    bool captured() const {
+        return graph_ != nullptr && core::backend_graph_is_captured(backend_, graph_);
+    }
+
     void enqueue() {
         core::set_backend_threads(backend_, threads_);
         if (core::compute_backend_graph_async(backend_, graph_, "breeze_tts.fused_depth") != GGML_STATUS_SUCCESS) {
@@ -1357,6 +1362,16 @@ private:
         graph_ = ggml_new_graph_custom(g, kGraphNodes, false);
         for (auto * token : tokens_out_) {
             ggml_build_forward_expand(graph_, token);
+        }
+        if (std::getenv("TMP_DUMP_DEPTH") != nullptr) { // TMPDIAG
+            for (int i = 0; i < ggml_graph_n_nodes(graph_); ++i) {
+                const ggml_tensor * n = ggml_graph_node(graph_, i);
+                std::fprintf(stderr, "[dnode] %d %s %s [%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu,%zu] s0=%s s1=%s s2=%s\n", i,
+                             ggml_op_desc(n), ggml_type_name(n->type), (long long)n->ne[0], (long long)n->ne[1],
+                             (long long)n->ne[2], (long long)n->ne[3], n->nb[0], n->nb[1], n->nb[2], n->nb[3],
+                             n->src[0] ? ggml_op_desc(n->src[0]) : "-", n->src[1] ? ggml_op_desc(n->src[1]) : "-",
+                             n->src[2] ? ggml_op_desc(n->src[2]) : "-");
+            }
         }
         gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
         if (gallocr_ == nullptr || !ggml_gallocr_reserve(gallocr_, graph_) || !ggml_gallocr_alloc_graph(gallocr_, graph_)) {
@@ -2271,9 +2286,6 @@ struct BreezeGeneratorRuntime::Impl {
                     depth_queued = false;
                     tmp_mark("release"); // TMPDIAG
                 } else {
-                    // The first launch of a run is never gated: ggml runs a graph op by
-                    // op until it is captured (again after weights move), and growing
-                    // its memory pool then may synchronize the device.
                     *buffers.first_token = first_token;
                     ggml_backend_tensor_set_async(backend, first_in, buffers.first_token, 0, sizeof(int32_t));
                     ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[use_slot], 0, noise_bytes);
@@ -2320,7 +2332,10 @@ struct BreezeGeneratorRuntime::Impl {
                 // offset and the noise is recomputed above, before the release).
                 const int next = use_slot ^ 1;
                 const uint64_t next_offset = state.offset_blocks + first_blocks;
-                if (gated) {
+                // Only a captured graph is queued behind a gate: until then ggml runs
+                // it op by op (again after weights move or an idle eviction), and
+                // growing its memory pool then may synchronize the device.
+                if (gated && fused_depth->captured()) {
                     queue_depth(next);
                 }
                 fused_depth->fill_noise(buffers.noise[next], request, state.fallback_rng, sampling_policy, next_offset);

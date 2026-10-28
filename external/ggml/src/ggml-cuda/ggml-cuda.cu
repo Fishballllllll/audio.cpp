@@ -5847,6 +5847,26 @@ void ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority)
     ctx->stream_priority = priority;
 }
 
+bool ggml_backend_cuda_graph_is_captured(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#ifdef USE_CUDA_GRAPH
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || cgraph == nullptr || cgraph->n_nodes == 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    // Look up without creating: a graph evicted for idling is not captured.
+    const auto it = ctx->cuda_graphs.find(ggml_cuda_graph_get_key(cgraph));
+    if (it == ctx->cuda_graphs.end()) {
+        return false;
+    }
+    const ggml_cuda_graph * graph = it->second.get();
+    return graph->is_enabled() && graph->warmup_complete && graph->instance != nullptr;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(cgraph);
+    return false;
+#endif
+}
+
 void ggml_backend_cuda_set_round_bf16_fusion(ggml_backend_t backend, bool enabled) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return;
@@ -6715,6 +6735,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_round_bf16_fusion") == 0) {
         return (void *)ggml_backend_cuda_set_round_bf16_fusion;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_is_captured") == 0) {
+        return (void *)ggml_backend_cuda_graph_is_captured;
     }
     if (strcmp(name, "ggml_backend_cuda_get_stream") == 0) {
         return (void *)ggml_backend_cuda_get_stream;

@@ -407,6 +407,17 @@ void set_backend_round_bf16_fusion(ggml_backend_t backend, bool enabled) {
     if (fn != nullptr) fn(backend, enabled);
 }
 
+bool backend_graph_is_captured(ggml_backend_t backend, ggml_cgraph * graph) {
+    if (backend == nullptr || graph == nullptr || !is_cuda_backend_handle(backend)) return false;
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (device == nullptr) return false;
+    auto fn = (bool (*)(ggml_backend_t, ggml_cgraph *))
+        ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(device),
+            "ggml_backend_cuda_graph_is_captured");
+    return fn != nullptr && fn(backend, graph);
+}
+
 void * backend_cuda_stream(ggml_backend_t backend) {
     if (backend == nullptr) return nullptr;
     if (!is_cuda_backend_handle(backend) && !is_hip_backend_handle(backend)) return nullptr;
