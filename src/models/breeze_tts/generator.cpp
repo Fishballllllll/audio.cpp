@@ -2169,6 +2169,16 @@ struct BreezeGeneratorRuntime::Impl {
         uint64_t noise_offset[2] = {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
         int slot = 0;
         const bool gated = buffers.gated;
+        static const bool tmp_trace = std::getenv("TMP_GATE_TRACE") != nullptr; // TMPDIAG
+        auto tmp_last = Clock::now(); // TMPDIAG
+        int tmp_frame = 0; // TMPDIAG
+        const auto tmp_mark = [&](const char * what) { // TMPDIAG
+            if (!tmp_trace) return;
+            const auto now = Clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - tmp_last).count();
+            tmp_last = now;
+            if (tmp_frame < 4 || ms > 50.0) std::fprintf(stderr, "[gate] frame %d %s %.3fms\n", tmp_frame, what, ms);
+        };
         bool depth_queued = false;  // a gated depth graph is waiting for its first token
         int queued_slot = 0;
         unsigned int queued_ticket = 0;
@@ -2176,8 +2186,11 @@ struct BreezeGeneratorRuntime::Impl {
         const auto queue_depth = [&](int noise_slot) {
             queued_ticket = ++buffers.ticket;
             breeze_gate_wait(stream, buffers.gate, queued_ticket, static_cast<int32_t *>(first_in->data));
+            tmp_mark("gate_wait"); // TMPDIAG
             ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[noise_slot], 0, noise_bytes);
+            tmp_mark("noise_set"); // TMPDIAG
             fused_depth->enqueue();
+            tmp_mark("depth_enqueue"); // TMPDIAG
             depth_queued = true;
             queued_slot = noise_slot;
         };
@@ -2188,6 +2201,7 @@ struct BreezeGeneratorRuntime::Impl {
                 depth_queued = false;
             }
             ggml_backend_synchronize(backend);
+            tmp_mark("drain"); // TMPDIAG
         };
 
         BreezeFrameEmbedArgs embed;
@@ -2244,6 +2258,7 @@ struct BreezeGeneratorRuntime::Impl {
                 if (first_token == config.codebook_pad_token_id) {
                     continue;
                 }
+                tmp_mark("sample"); // TMPDIAG
                 const auto frame_start = Clock::now();
                 const int use_slot = depth_queued ? queued_slot : slot;
                 // A pad draw moves the offset; a gated graph has not copied its noise yet.
@@ -2251,13 +2266,14 @@ struct BreezeGeneratorRuntime::Impl {
                     fused_depth->fill_noise(buffers.noise[use_slot], request, state.fallback_rng, sampling_policy, state.offset_blocks);
                     noise_offset[use_slot] = state.offset_blocks;
                 }
-                if (gated) {
-                    if (!depth_queued) {
-                        queue_depth(use_slot);
-                    }
+                if (depth_queued) {
                     breeze_gate_release(buffers.gate, queued_ticket, first_token);
                     depth_queued = false;
+                    tmp_mark("release"); // TMPDIAG
                 } else {
+                    // The first launch of a run is never gated: ggml runs a graph op by
+                    // op until it is captured (again after weights move), and growing
+                    // its memory pool then may synchronize the device.
                     *buffers.first_token = first_token;
                     ggml_backend_tensor_set_async(backend, first_in, buffers.first_token, 0, sizeof(int32_t));
                     ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[use_slot], 0, noise_bytes);
@@ -2278,7 +2294,9 @@ struct BreezeGeneratorRuntime::Impl {
                 embed.out = static_cast<float *>(backbone_in->data);
                 embed.codes = static_cast<int32_t *>(buffers.codes->data);
                 breeze_frame_embed(stream, embed);
+                tmp_mark("embed"); // TMPDIAG
                 const auto step = backbone_cond->enqueue_batched_decode_step();
+                tmp_mark("backbone"); // TMPDIAG
                 if (step.logits == nullptr || step.hidden == nullptr ||
                     ggml_nelements(step.logits) != static_cast<int64_t>(2 * logits_size) ||
                     ggml_nbytes(step.hidden) != 2 * hidden_bytes || !ggml_is_contiguous(step.hidden) ||
@@ -2290,6 +2308,13 @@ struct BreezeGeneratorRuntime::Impl {
                                               static_cast<size_t>(codebooks) * sizeof(int32_t));
                 ggml_backend_tensor_get_async(backend, step.logits, buffers.logits, 0, 2 * logits_size * sizeof(float));
                 breeze_event_record(buffers.event, stream);
+                tmp_mark("readback_q"); // TMPDIAG
+
+                // The codec decodes on this thread and may synchronize the whole
+                // device (freeing a buffer does), so it runs before the next gate
+                // is queued: a pending gate waits for this thread to release it.
+                push_pending();
+                tmp_mark("codec"); // TMPDIAG
 
                 // Next frame, assuming its first draw is not a pad (a pad moves the
                 // offset and the noise is recomputed above, before the release).
@@ -2298,10 +2323,12 @@ struct BreezeGeneratorRuntime::Impl {
                 if (gated) {
                     queue_depth(next);
                 }
-                push_pending();
                 fused_depth->fill_noise(buffers.noise[next], request, state.fallback_rng, sampling_policy, next_offset);
                 noise_offset[next] = next_offset;
+                tmp_mark("fill_noise"); // TMPDIAG
                 breeze_event_synchronize(buffers.event);
+                tmp_mark("event_sync"); // TMPDIAG
+                ++tmp_frame; // TMPDIAG
                 if (gated && breeze_gate_failed(buffers.gate)) {
                     throw std::runtime_error("BreezeTTS pipelined frames: the device gave up waiting for the host");
                 }

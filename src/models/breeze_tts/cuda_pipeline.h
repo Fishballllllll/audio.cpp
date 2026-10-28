@@ -42,10 +42,13 @@ struct BreezeGate {
 bool breeze_gate_create(BreezeGate & gate);
 void breeze_gate_destroy(BreezeGate & gate);
 // Queues a wait until the host releases `ticket`, then writes the released token
-// to token_dst. If no release arrives within ~10 s the wait gives up and sets the
-// error flag, so a stuck host shows up as an error instead of a hang.
+// to token_dst. If no release arrives within ~10 s the wait gives up, writes token
+// 0 and sets the error flag, so a stuck host shows up as an error instead of a hang.
+// While a wait is pending, the releasing thread must not synchronize the whole
+// device (cudaFree, cudaDeviceSynchronize, ...): that would wait on itself.
 void breeze_gate_wait(void * stream, const BreezeGate & gate, unsigned int ticket, int32_t * token_dst);
 void breeze_gate_release(const BreezeGate & gate, unsigned int ticket, int32_t token);
+// Returns whether a wait gave up since the last call, and clears the flag.
 bool breeze_gate_failed(const BreezeGate & gate);
 
 void * breeze_event_create();

@@ -92,6 +92,8 @@ __global__ void gate_kernel(volatile unsigned long long * words, unsigned int ti
     // Tickets only grow; compare as a signed difference so a wrap is harmless.
     while (static_cast<int>(static_cast<unsigned int>(word) - ticket) < 0) {
         if (global_ns() - start > 10ull * 1000 * 1000 * 1000) {
+            // Token 0 is in range, so the queued graph still runs safely.
+            *token_dst = 0;
             words[1] = 1;
             return;
         }
@@ -143,7 +145,8 @@ void breeze_gate_release(const BreezeGate & gate, unsigned int ticket, int32_t t
 }
 
 bool breeze_gate_failed(const BreezeGate & gate) {
-    return __atomic_load_n(gate.host + 1, __ATOMIC_ACQUIRE) != 0;
+    // Reading clears the flag, so one failure does not fail every later request.
+    return __atomic_exchange_n(gate.host + 1, 0ull, __ATOMIC_ACQ_REL) != 0;
 }
 
 void * breeze_event_create() {
