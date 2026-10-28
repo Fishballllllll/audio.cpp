@@ -48,6 +48,18 @@ public:
         int64_t context_frames,
         int64_t new_frames,
         int64_t frames_per_chunk) const;
+    // decode_stream_chunk() split in two, so decoding overlaps the caller: queue
+    // a chunk on the decoder's backend, then collect its audio later (at most one
+    // chunk is queued; collecting with none queued returns empty audio).
+    void enqueue_stream_chunk(
+        const BreezeSpeechCodes & codec_codes,
+        int64_t context_frames,
+        int64_t new_frames,
+        int64_t frames_per_chunk) const;
+    runtime::AudioBuffer collect_stream_chunk() const;
+    bool stream_chunk_queued() const { return queued_graph_ != nullptr; }
+    // Waits for and drops a queued chunk.
+    void discard_stream_chunk() const;
     runtime::AudioBuffer decode_and_trim_reference(
         const BreezeSpeechCodes & reference_codes,
         const BreezeSpeechCodes & generated_codes) const;
@@ -73,6 +85,10 @@ private:
     // Always present to keep this public class layout identical when the private
     // Strix Halo compile definition differs between translation units.
     mutable std::array<std::unique_ptr<BreezeSpeechDecoderGraph>, 2> optimized_graphs_;
+    // The chunk queued by enqueue_stream_chunk(), if any.
+    mutable BreezeSpeechDecoderGraph * queued_graph_ = nullptr;
+    mutable int64_t queued_context_frames_ = 0;
+    mutable int64_t queued_new_frames_ = 0;
 };
 
 }  // namespace breeze_tts

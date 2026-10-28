@@ -989,6 +989,12 @@ public:
     }
 
     std::vector<float> run(const int32_t * codes, size_t code_count) {
+        launch(codes, code_count, false);
+        return read_output();
+    }
+
+    // Uploads the inputs and queues the graph; with async, returns without waiting.
+    void launch(const int32_t * codes, size_t code_count, bool async) {
         const int64_t input_frames = static_cast<int64_t>(code_count / weights_->config.num_quantizers);
         const size_t expected = static_cast<size_t>(code_frames_ * weights_->config.num_quantizers);
         if (code_count % static_cast<size_t>(weights_->config.num_quantizers) != 0 || input_frames <= 0 || input_frames > code_frames_) {
@@ -1007,10 +1013,16 @@ public:
         }
         ggml_backend_tensor_set(codes_, tensor_codes.data(), 0, tensor_codes.size() * sizeof(int32_t));
         core::set_backend_threads(backend_, compute_threads_);
-        const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+        const ggml_status status = async ? engine::core::compute_backend_graph_async(backend_, graph_)
+                                         : engine::core::compute_backend_graph(backend_, graph_);
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("Breeze speech decoder graph compute failed");
         }
+    }
+
+    // Waits for the queued graph and reads its waveform.
+    std::vector<float> read_output() {
+        ggml_backend_synchronize(backend_);
         std::vector<float> audio(static_cast<size_t>(waveform_frames_), 0.0F);
         ggml_backend_tensor_get(output_, audio.data(), 0, audio.size() * sizeof(float));
         return audio;
@@ -1164,6 +1176,7 @@ runtime::AudioBuffer BreezeSpeechDecoderRuntime::decode_stream_chunk(
     int64_t context_frames,
     int64_t new_frames,
     int64_t frames_per_chunk) const {
+    discard_stream_chunk();
     const auto total_start = Clock::now();
     if (frames_per_chunk <= 0 || context_frames < 0 || context_frames > kLeftContextFrames ||
         new_frames <= 0 || context_frames + new_frames > codec_codes.frames ||
@@ -1189,6 +1202,58 @@ runtime::AudioBuffer BreezeSpeechDecoderRuntime::decode_stream_chunk(
     samples.erase(samples.begin(), samples.begin() + context_frames * kDecodeSamplesPerCode);
     engine::debug::timing_log_scalar("breeze_tts.speech_decoder.streaming_ms", engine::debug::elapsed_ms(total_start, Clock::now()));
     return runtime::AudioBuffer{kSampleRate, 1, std::move(samples)};
+}
+
+void BreezeSpeechDecoderRuntime::enqueue_stream_chunk(
+    const BreezeSpeechCodes & codec_codes,
+    int64_t context_frames,
+    int64_t new_frames,
+    int64_t frames_per_chunk) const {
+    if (queued_graph_ != nullptr) {
+        throw std::runtime_error("Breeze speech decoder already has a queued streaming chunk");
+    }
+    if (frames_per_chunk <= 0 || context_frames < 0 || context_frames > kLeftContextFrames ||
+        new_frames <= 0 || context_frames + new_frames > codec_codes.frames ||
+        codec_codes.frames - context_frames > frames_per_chunk ||
+        codec_codes.code_groups != weights_->config.num_quantizers) {
+        throw std::runtime_error("Breeze speech decoder received invalid streaming codec shape");
+    }
+    if (static_cast<int64_t>(codec_codes.codes.size()) != codec_codes.frames * codec_codes.code_groups) {
+        throw std::runtime_error("Breeze speech decoder streaming codec payload size mismatch");
+    }
+    // The same graph choice as decode_stream_chunk().
+    const bool initial = context_frames == 0;
+    const int64_t capacity = initial ? codec_codes.frames : kLeftContextFrames + frames_per_chunk;
+    auto & graph = initial ? stream_initial_graph_ : stream_graph_;
+    const int threads = std::max(1, execution_context_->config().threads);
+    if (graph == nullptr || !graph->matches(*weights_, capacity, execution_context_->backend(), threads)) {
+        graph.reset();
+        graph = std::make_unique<BreezeSpeechDecoderGraph>(
+            weights_, capacity, *execution_context_, *constants_, graph_arena_bytes_, allow_flash_attention_);
+    }
+    graph->launch(codec_codes.codes.data(), codec_codes.codes.size(), true);
+    queued_graph_ = graph.get();
+    queued_context_frames_ = context_frames;
+    queued_new_frames_ = new_frames;
+}
+
+runtime::AudioBuffer BreezeSpeechDecoderRuntime::collect_stream_chunk() const {
+    if (queued_graph_ == nullptr) {
+        return runtime::AudioBuffer{kSampleRate, 1, {}};
+    }
+    auto * graph = queued_graph_;
+    queued_graph_ = nullptr;
+    // Causal attention and convolutions make right padding independent of valid samples.
+    auto samples = graph->read_output();
+    samples.resize(static_cast<size_t>((queued_context_frames_ + queued_new_frames_) * kDecodeSamplesPerCode));
+    samples.erase(samples.begin(), samples.begin() + queued_context_frames_ * kDecodeSamplesPerCode);
+    return runtime::AudioBuffer{kSampleRate, 1, std::move(samples)};
+}
+
+void BreezeSpeechDecoderRuntime::discard_stream_chunk() const {
+    if (queued_graph_ != nullptr) {
+        (void) collect_stream_chunk();
+    }
 }
 
 runtime::AudioBuffer BreezeSpeechDecoderRuntime::decode_and_trim_reference(
@@ -1229,6 +1294,7 @@ runtime::AudioBuffer BreezeSpeechDecoderRuntime::decode_and_trim_reference(
 }
 
 void BreezeSpeechDecoderRuntime::release_runtime_graphs() const {
+    discard_stream_chunk();
     graph_.reset();
     stream_initial_graph_.reset();
     stream_graph_.reset();
@@ -1238,6 +1304,7 @@ void BreezeSpeechDecoderRuntime::release_runtime_graphs() const {
 }
 
 void BreezeSpeechDecoderRuntime::release_weights() {
+    discard_stream_chunk();
     weights_->store->release();
 }
 

@@ -2433,20 +2433,35 @@ struct BreezeGeneratorRuntime::Impl {
             begin_stream(request);
             config.frame_width = static_cast<size_t>(assets->config.num_codebooks);
             config.left_context_frames = BreezeSpeechDecoderRuntime::kLeftContextFrames;
+            const auto clamp_audio = [](runtime::AudioBuffer audio) {
+                for (float & sample : audio.samples) {
+                    sample = std::clamp(sample, -1.0F, 1.0F);
+                }
+                return audio;
+            };
+            // With its own backend the codec decodes one chunk behind: each window
+            // collects the previous chunk's audio (long finished) and queues its own,
+            // so this thread no longer waits for the codec. The first chunk is decoded
+            // at once (first-packet latency) and the last one is drained at the end;
+            // the audio and its order are unchanged.
+            const bool codec_behind = codec_execution != nullptr && std::getenv("BREEZE_CODEC_SYNC") == nullptr;
             stream_audio_.begin(config,
-                [this, config](const runtime::StreamingAudioWindow<int32_t> & window) {
+                [this, config, codec_behind, clamp_audio](const runtime::StreamingAudioWindow<int32_t> & window) {
                     BreezeSpeechCodes codes;
                     codes.frames = static_cast<int64_t>(window.frames());
                     codes.code_groups = static_cast<int64_t>(window.frame_width);
                     codes.codes.assign(window.data, window.data + window.frames() * window.frame_width);
-                    auto audio = speech_decoder->decode_stream_chunk(
-                        codes, window.left_frames, window.new_frames,
-                        config.frames_per_chunk + config.right_context_frames);
-                    for (float & sample : audio.samples) {
-                        sample = std::clamp(sample, -1.0F, 1.0F);
+                    const int64_t capacity = static_cast<int64_t>(config.frames_per_chunk + config.right_context_frames);
+                    if (!codec_behind || window.first_frame == 0) {
+                        return clamp_audio(speech_decoder->decode_stream_chunk(
+                            codes, window.left_frames, window.new_frames, capacity));
                     }
-                    return audio;
-                }, std::move(sink));
+                    auto previous = speech_decoder->collect_stream_chunk();
+                    speech_decoder->enqueue_stream_chunk(codes, window.left_frames, window.new_frames, capacity);
+                    return clamp_audio(std::move(previous));
+                }, std::move(sink), {},
+                [this] { speech_decoder->discard_stream_chunk(); },
+                [this, clamp_audio] { return clamp_audio(speech_decoder->collect_stream_chunk()); });
             if (pipeline_usable(*stream_)) {
                 stream_->ar_total_ms += engine::debug::measure_ms([&] {
                     run_pipelined_frames(captured, generated_codes != nullptr);
