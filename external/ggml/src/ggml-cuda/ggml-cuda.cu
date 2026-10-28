@@ -4505,8 +4505,10 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
 
     // (e) ROUND(x) -> RESHAPE -> MUL_MAT on mul_mat_vec_q with q8_0 weights: write the rounded
     //     values with their q8_1 rows, so mmvq skips its quantization; the RESHAPEs are no-ops.
+    // Each thread reads x[i] before writing round[i]: an exact in-place alias is safe.
     if (consumer->op == GGML_OP_MUL_MAT && ggml_is_contiguous(x) && ggml_nelements(x) == ggml_nelements(round) &&
-        !ggml_cuda_ranges_overlap(round, x) && ggml_cuda_prequant_q8_1_consumer(cgraph, i) == consumer) {
+        (!ggml_cuda_ranges_overlap(round, x) || round->data == x->data) &&
+        ggml_cuda_prequant_q8_1_consumer(cgraph, i) == consumer) {
         ggml_cuda_op_round_bf16_q8_1(*cuda_ctx, x, round, ggml_cuda_prequant_q8_1_rows(*cuda_ctx, consumer));
         return 1;
     }
