@@ -269,6 +269,50 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     }
 }
 
+// The sort key cub's radix sort uses for a float: the bits twiddled so unsigned
+// order is float order, with -0.0 taken as +0.0 (cub's ProcessFloatMinusZero).
+static __device__ __forceinline__ uint32_t argsort_desc_key(const float v) {
+    uint32_t bits = __float_as_uint(v);
+    if (bits == 0x80000000u) {
+        bits = 0;
+    }
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// One warp per element: its rank is the number of elements a stable descending
+// sort puts first (a larger key, or the same key at a smaller index).
+static __global__ void argsort_top_k_desc_kernel(const float * x, int * dst, const int ncols, const int k) {
+    extern __shared__ uint32_t keys[];
+    for (int j = threadIdx.x; j < ncols; j += blockDim.x) {
+        keys[j] = argsort_desc_key(x[j]);
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int i    = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    if (i >= ncols) {
+        return;
+    }
+    const uint32_t key = keys[i];
+    int rank = 0;
+    for (int j = lane; j < ncols; j += WARP_SIZE) {
+        const uint32_t other = keys[j];
+        rank += other > key || (other == key && j < i);
+    }
+    rank = warp_reduce_sum(rank);
+    if (lane == 0 && rank < k) {
+        dst[rank] = i;
+    }
+}
+
+void argsort_f32_i32_top_k_desc_cuda(const float * x, int * dst, const int ncols, const int k, cudaStream_t stream) {
+    GGML_ASSERT(ncols > 0 && ncols <= 4096 && k > 0 && k <= ncols);
+    constexpr int threads = 256;
+    constexpr int per_block = threads / WARP_SIZE;
+    argsort_top_k_desc_kernel<<<(ncols + per_block - 1) / per_block, threads, ncols * sizeof(uint32_t), stream>>>(
+        x, dst, ncols, k);
+}
+
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;

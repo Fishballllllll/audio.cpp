@@ -4662,7 +4662,36 @@ static int ggml_cuda_try_fuse_pick_top_candidate(ggml_backend_cuda_context * cud
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
+// ARGSORT (descending, one row) whose only use is a VIEW of its first k entries:
+// rank just those k instead of sorting the whole row. The VIEW is a no-op.
+static int ggml_cuda_try_fuse_argsort_top_k(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_ARGSORT_TOP_K") != nullptr;
+    ggml_tensor * sort = cgraph->nodes[i];
+    if (disabled || sort->op != GGML_OP_ARGSORT || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * src  = sort->src[0];
+    const ggml_tensor * view = cgraph->nodes[i + 1];
+    const int64_t ncols = src->ne[0];
+    if ((ggml_sort_order) sort->op_params[0] != GGML_SORT_ORDER_DESC || src->type != GGML_TYPE_F32 ||
+        sort->type != GGML_TYPE_I32 || !ggml_is_contiguous(src) || ggml_nrows(src) != 1 || ncols > 4096 ||
+        (sort->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+        view->op != GGML_OP_VIEW || view->src[0] != sort || view->view_offs != 0 || ggml_nrows(view) != 1 ||
+        view->nb[0] != sizeof(int32_t) || view->ne[0] > 64 || view->ne[0] > ncols) {
+        return 0;
+    }
+    argsort_f32_i32_top_k_desc_cuda((const float *) src->data, (int *) sort->data, (int) ncols, (int) view->ne[0],
+                                    cuda_ctx->stream());
+    return 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    {
+        const int skip = ggml_cuda_try_fuse_argsort_top_k(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
