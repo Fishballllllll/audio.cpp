@@ -2081,6 +2081,7 @@ struct BreezeGeneratorRuntime::Impl {
         size_t noise_floats = 0;
         float * logits = nullptr;            // [logits_size, 2]
         float * noise[2] = {nullptr, nullptr};
+        void * noise_alias[2] = {nullptr, nullptr};  // device view of noise, when the device can read it
         int32_t * codes_host = nullptr;      // [num_codebooks]
         int32_t * first_token = nullptr;
         BreezeGate gate;                     // empty when the device cannot map pinned memory
@@ -2141,6 +2142,9 @@ struct BreezeGeneratorRuntime::Impl {
         }
         buffers->gated = std::getenv("BREEZE_PIPELINE_NO_GATE") == nullptr && breeze_gate_create(buffers->gate);
         buffers->event = breeze_event_create();
+        for (int i = 0; i < 2; ++i) {
+            buffers->noise_alias[i] = breeze_device_alias(buffers->noise[i]);
+        }
         buffers->logits_floats = logits_floats;
         buffers->noise_floats = noise_floats;
         current = std::move(buffers);
@@ -2233,7 +2237,13 @@ struct BreezeGeneratorRuntime::Impl {
             queued_ticket = ++buffers.ticket;
             breeze_gate_wait(stream, buffers.gate, queued_ticket, static_cast<int32_t *>(first_in->data));
             tmp_mark("gate_wait"); // TMPDIAG
-            ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[noise_slot], 0, noise_bytes);
+            // Read by a kernel straight after the gate: no switch to a copy engine on
+            // the critical path. The host writes the noise before it releases the gate.
+            if (buffers.noise_alias[noise_slot] != nullptr) {
+                breeze_fetch_async(stream, noise_in->data, buffers.noise_alias[noise_slot], noise_bytes);
+            } else {
+                ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[noise_slot], 0, noise_bytes);
+            }
             tmp_mark("noise_set"); // TMPDIAG
             fused_depth->enqueue();
             tmp_mark("depth_enqueue"); // TMPDIAG

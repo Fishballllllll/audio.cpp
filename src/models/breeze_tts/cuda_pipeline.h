@@ -30,6 +30,12 @@ void breeze_frame_embed(void * stream, const BreezeFrameEmbedArgs & args);
 
 void breeze_copy_device_async(void * stream, void * dst, const void * src, size_t bytes);
 
+// The device address of pinned host memory, or nullptr if the device cannot read it.
+void * breeze_device_alias(void * host);
+// Copies bytes (a multiple of 16) from device-readable pinned host memory with a
+// kernel, so a copy queued between kernels does not switch to a copy engine.
+void breeze_fetch_async(void * stream, void * dst, const void * src_alias, size_t bytes);
+
 // A gate lets the host queue a graph before its first token is known: the device
 // waits on a host-mapped word, so the costly graph launch overlaps the previous
 // frame instead of sitting between the host's sampling and the device.

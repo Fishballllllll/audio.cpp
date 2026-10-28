@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -76,6 +77,40 @@ void breeze_frame_embed(void * stream, const BreezeFrameEmbedArgs & args) {
 
 void breeze_copy_device_async(void * stream, void * dst, const void * src, size_t bytes) {
     check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)), "device copy");
+}
+
+namespace {
+
+__global__ void fetch_kernel(uint4 * dst, const uint4 * src, size_t count) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        // Fetch again every time: an earlier frame read the same host memory.
+        dst[i] = __ldcv(src + i);
+    }
+}
+
+}  // namespace
+
+void * breeze_device_alias(void * host) {
+    void * device = nullptr;
+    if (host == nullptr || cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    return device;
+}
+
+void breeze_fetch_async(void * stream, void * dst, const void * src_alias, size_t bytes) {
+    if (bytes % sizeof(uint4) != 0 || reinterpret_cast<uintptr_t>(dst) % sizeof(uint4) != 0 ||
+        reinterpret_cast<uintptr_t>(src_alias) % sizeof(uint4) != 0) {
+        throw std::runtime_error("BreezeTTS pipelined frame: fetch needs 16-byte aligned sizes and addresses");
+    }
+    const size_t count = bytes / sizeof(uint4);
+    constexpr int threads = 256;
+    const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count + threads - 1) / threads, 64));
+    fetch_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<uint4 *>(dst), static_cast<const uint4 *>(src_alias), count);
+    check(cudaGetLastError(), "fetch launch");
 }
 
 namespace {

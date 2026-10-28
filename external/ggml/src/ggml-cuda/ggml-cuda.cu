@@ -4483,12 +4483,17 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
                 }
                 last = j + 3;
             }
-            // [-> CPY(f16)]: an f16 K/V state; write the rounded values cast to f16.
-            ggml_tensor * cpy = cgraph->nodes[j + 2];
+            // [-> CPY(f16)]: an f16 K/V state; write the rounded values cast to f16. The
+            // CPY's destination view (a row of a K/V cache) may sit just before it.
+            int c = j + 2;
+            if (cgraph->nodes[c]->op == GGML_OP_VIEW && cgraph->nodes[c]->src[0] != round_out) {
+                ++c;
+            }
+            ggml_tensor * cpy = cgraph->nodes[c];
             if (last == j + 1 && cpy->op == GGML_OP_CPY && cpy->src[0] == round_out && cpy->type == GGML_TYPE_F16 &&
                 ggml_is_contiguous(cpy) && ggml_are_same_shape(cpy, round_out) && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                 out = *cpy;
-                last = j + 2;
+                last = c;
             }
         }
         const ggml_tensor * written = cgraph->nodes[last];
