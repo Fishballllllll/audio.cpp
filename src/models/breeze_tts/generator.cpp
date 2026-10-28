@@ -842,7 +842,8 @@ public:
           config_(config),
           projector_(weights.depth_projector),
           heads_(weights.depth_heads),
-          store_(backend, backend_type, "breeze_tts.fused_depth.weights", 1024ull * 1024ull) {
+          store_(backend, backend_type, "breeze_tts.fused_depth.weights", 1024ull * 1024ull),
+          rows_store_(backend, backend_type, "breeze_tts.fused_depth.embedding_rows", 64ull * 1024ull) {
         if (config_.num_codebooks <= 1 || config_.vocab_size < kCodecCodebookSize) {
             throw std::runtime_error("BreezeTTS fused depth shape is invalid");
         }
@@ -886,10 +887,12 @@ public:
 
     void release_weights() {
         store_.release();
+        rows_store_.release();
     }
 
     void restore_weights() {
         store_.restore();
+        rows_store_.restore();
     }
 
     ~BreezeFusedDepthRuntime() {
@@ -1193,8 +1196,90 @@ private:
         tokens_out_.clear();
     }
 
+    // A step embeds its sampled token as project(table row), a function of
+    // (codebook, token) only. Run that same single-row projection once for every
+    // (codebook, token) a step can embed and keep the rows, so each step gathers
+    // one row instead of a mat-vec (same values: same kernels, same shapes).
+    void build_embedding_rows() {
+        const auto start = Clock::now();
+        const int64_t hidden = config_.hidden_size;
+        const int64_t depth_hidden = config_.depth_hidden_size;
+        const int64_t vocab = config_.vocab_size;
+        const int64_t codebooks = config_.num_codebooks - 1;
+        const size_t table_row = table_.tensor->nb[1];
+        std::vector<float> rows(static_cast<size_t>(codebooks * vocab * depth_hidden));
+        std::vector<int32_t> tokens(static_cast<size_t>(vocab));
+        for (int64_t token = 0; token < vocab; ++token) {
+            tokens[static_cast<size_t>(token)] = static_cast<int32_t>(token);
+        }
+        const size_t nodes = static_cast<size_t>(8 * vocab + 64);
+        try {
+            for (int64_t codebook = 0; codebook < codebooks; ++codebook) {
+                std::unique_ptr<ggml_context, GgmlContextDeleter> out_ctx(
+                    ggml_init({ggml_tensor_overhead() * 4, nullptr, true}));
+                std::unique_ptr<ggml_context, GgmlContextDeleter> ctx(ggml_init(
+                    {ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false), nullptr, true}));
+                if (out_ctx == nullptr || ctx == nullptr) {
+                    throw std::runtime_error("context");
+                }
+                ggml_tensor * out = ggml_new_tensor_2d(out_ctx.get(), GGML_TYPE_F32, depth_hidden, vocab);
+                ggml_backend_buffer_t out_buffer = ggml_backend_alloc_ctx_tensors(out_ctx.get(), backend_);
+                if (out_buffer == nullptr) {
+                    throw std::runtime_error("buffer");
+                }
+                ggml_context * g = ctx.get();
+                core::ModuleBuildContext build_ctx{g, "breeze_tts.fused_depth.embedding_rows", backend_type_};
+                ggml_tensor * ids = ggml_new_tensor_1d(g, GGML_TYPE_I32, vocab);
+                ggml_set_input(ids);
+                auto * table = ggml_view_2d(
+                    g, table_.tensor, hidden, vocab, table_row, static_cast<size_t>(codebook * vocab) * table_row);
+                ggml_tensor * gathered = ggml_get_rows(g, table, ids);
+                ggml_cgraph * graph = ggml_new_graph_custom(g, nodes, false);
+                for (int64_t token = 0; token < vocab; ++token) {
+                    auto * row = ggml_view_2d(g, gathered, hidden, 1, gathered->nb[1], static_cast<size_t>(token) * gathered->nb[1]);
+                    auto * projected = modules::LinearModule({hidden, depth_hidden, false})
+                                           .build(build_ctx, core::wrap_tensor(row, core::TensorShape::from_dims({1, hidden})), projector_)
+                                           .tensor;
+                    ggml_build_forward_expand(graph, ggml_cpy(g, projected,
+                        ggml_view_2d(g, out, depth_hidden, 1, out->nb[1], static_cast<size_t>(token) * out->nb[1])));
+                }
+                ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+                const bool ok = allocr != nullptr && ggml_gallocr_alloc_graph(allocr, graph);
+                if (ok) {
+                    ggml_backend_tensor_set(ids, tokens.data(), 0, tokens.size() * sizeof(int32_t));
+                }
+                const bool computed = ok && core::compute_backend_graph(backend_, graph) == GGML_STATUS_SUCCESS;
+                if (computed) {
+                    ggml_backend_tensor_get(out, rows.data() + static_cast<size_t>(codebook * vocab * depth_hidden), 0,
+                                            ggml_nbytes(out));
+                }
+                core::release_backend_graph_resources(backend_, graph, true);
+                if (allocr != nullptr) {
+                    ggml_gallocr_free(allocr);
+                }
+                ggml_backend_buffer_free(out_buffer);
+                if (!computed) {
+                    throw std::runtime_error("compute");
+                }
+            }
+        } catch (const std::exception & error) {
+            // Keep projecting in the graph.
+            engine::debug::trace_log_scalar("breeze_tts.fused_depth.embedding_rows_failed", std::string_view(error.what()));
+            embedding_rows_failed_ = true;
+            return;
+        }
+        embedding_rows_ = rows_store_.make_f32(
+            core::TensorShape::from_dims({codebooks * vocab, depth_hidden}), std::move(rows));
+        rows_store_.upload();
+        engine::debug::timing_log_scalar("breeze_tts.fused_depth.embedding_rows_ms", engine::debug::elapsed_ms(start));
+    }
+
     void build(const Key & key) {
         release();
+        if (embedding_rows_.tensor == nullptr && !embedding_rows_failed_ && backend_type_ == core::BackendType::Cuda &&
+            getenv("TMP_NO_EMBED_ROWS") == nullptr) { // TMPDIAG env
+            build_embedding_rows();
+        }
         const int64_t batch = key.batch;
         const int64_t hidden = config_.hidden_size;
         const int64_t depth_hidden = config_.depth_hidden_size;
@@ -1272,9 +1357,17 @@ private:
         ggml_tensor * prefix = ggml_reshape_3d(g, project(hidden_in_, batch), depth_hidden, 1, batch);
         const size_t table_row = table_.tensor->nb[1];
         const auto embed = [&](int64_t codebook, ggml_tensor * token) {
-            auto * table = ggml_view_2d(
-                g, table_.tensor, hidden, vocab, table_row, static_cast<size_t>(codebook * vocab) * table_row);
-            auto * projected = ggml_reshape_3d(g, project(ggml_get_rows(g, table, token), 1), depth_hidden, 1, 1);
+            ggml_tensor * projected = nullptr;
+            if (embedding_rows_.tensor != nullptr) {
+                const size_t row = embedding_rows_.tensor->nb[1];
+                auto * rows = ggml_view_2d(
+                    g, embedding_rows_.tensor, depth_hidden, vocab, row, static_cast<size_t>(codebook * vocab) * row);
+                projected = ggml_reshape_3d(g, ggml_get_rows(g, rows, token), depth_hidden, 1, 1);
+            } else {
+                auto * table = ggml_view_2d(
+                    g, table_.tensor, hidden, vocab, table_row, static_cast<size_t>(codebook * vocab) * table_row);
+                projected = ggml_reshape_3d(g, project(ggml_get_rows(g, table, token), 1), depth_hidden, 1, 1);
+            }
             return batch == 1 ? projected : ggml_repeat(g, projected, prefix);
         };
 
@@ -1423,6 +1516,10 @@ private:
     core::TensorValue heads_;
     core::BackendWeightStore store_;
     core::TensorValue table_;
+    // project(table row) for every (codebook, token) a step embeds: [depth_hidden, codebooks * vocab] f32.
+    core::BackendWeightStore rows_store_;
+    core::TensorValue embedding_rows_;
+    bool embedding_rows_failed_ = false;
     std::unique_ptr<ggml_context, GgmlContextDeleter> inputs_ctx_;
     ggml_backend_buffer_t inputs_buffer_ = nullptr;
     std::unique_ptr<ggml_context, GgmlContextDeleter> graph_ctx_;
