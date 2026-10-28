@@ -896,3 +896,74 @@ void ggml_cuda_op_round_rope_qkv(ggml_backend_cuda_context & ctx,
             v_x->nb[1], v_x->nb[2], v_x->nb[3]);
     }
 }
+
+// One row per block: ROUND_BF16(x) -> RMS_NORM -> MUL -> ROUND_BF16 exactly as rms_norm_f32<block_size>
+// (multiply, round, round_in) computes it, then ROPE(NEOX) -> ROUND_BF16 of that rounded row as
+// rope_neox computes it, reading the row from shared memory.
+template <int block_size, bool has_ff>
+static __global__ void round_rms_norm_rope(const float * x, const int64_t stride_row, const int64_t stride_channel,
+                                           const int64_t stride_sample, const float eps, const float * mul,
+                                           const rope_neox_launch r) {
+    __shared__ float s_sum[32];
+    __shared__ float row[2*CUDA_ROPE_BLOCK_SIZE];
+    const int ncols     = r.ne00;
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int tid       = threadIdx.x;
+
+    x += blockIdx.z*stride_sample + blockIdx.y*stride_channel + blockIdx.x*stride_row;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = rope_round<true>(x[col]);
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xv    = rope_round<true>(x[col]);
+        const float value = scale * xv * mul[col];
+        row[col]          = rope_round<true>(value);
+    }
+    __syncthreads();
+
+    const int i0 = 2*tid;
+    if (i0 < ncols) {
+        const int row_dst = (blockIdx.z*nchannels + blockIdx.y)*nrows + blockIdx.x;
+        rope_neox_row<true, has_ff, float, float, true, false>(
+            row, (float *) r.dst, r.ne00, r.ne01, r.ne02, 0, 0, 0, r.s1, r.s2, r.s3, r.n_dims, r.pos, r.freq_scale,
+            r.ext_factor, r.attn_factor, r.corr_dims, r.theta_scale, r.freq_factors, nullptr, 0, row_dst, i0);
+    }
+}
+
+void ggml_cuda_op_round_rms_norm_rope(ggml_backend_cuda_context & ctx, const ggml_tensor * src_unrounded,
+                                      const ggml_tensor * rms, const ggml_tensor * mul, const ggml_tensor * rope,
+                                      const ggml_tensor * out) {
+    const int64_t ncols = src_unrounded->ne[0];
+    GGML_ASSERT(((const int32_t *) rope->op_params)[2] == GGML_ROPE_TYPE_NEOX);
+    GGML_ASSERT(src_unrounded->type == GGML_TYPE_F32 && src_unrounded->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(src_unrounded, rms->src[0]) && ggml_nrows(src_unrounded) == ggml_nrows(rope));
+    GGML_ASSERT(rope->ne[0] == ncols && ncols % 2 == 0 && ncols <= 2*CUDA_ROPE_BLOCK_SIZE && ncols < 1024);
+    GGML_ASSERT(ggml_is_contiguous(rope->src[0]) && rope->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && ggml_nelements(mul) == ncols);
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && ggml_are_same_shape(out, rope));
+
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const rope_neox_launch r = rope_neox_launch_for(rope, rope->src[0], out);
+    const dim3 blocks_num(src_unrounded->ne[1], src_unrounded->ne[2], src_unrounded->ne[3]);
+    const int64_t s01 = src_unrounded->nb[1] / sizeof(float);
+    const int64_t s02 = src_unrounded->nb[2] / sizeof(float);
+    const int64_t s03 = src_unrounded->nb[3] / sizeof(float);
+    // rms_norm_f32 uses 256 threads below 1024 columns.
+    if (r.freq_factors != nullptr) {
+        round_rms_norm_rope<256, true><<<blocks_num, 256, 0, ctx.stream()>>>(
+            (const float *) src_unrounded->data, s01, s02, s03, eps, (const float *) mul->data, r);
+    } else {
+        round_rms_norm_rope<256, false><<<blocks_num, 256, 0, ctx.stream()>>>(
+            (const float *) src_unrounded->data, s01, s02, s03, eps, (const float *) mul->data, r);
+    }
+}

@@ -4691,7 +4691,31 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
             src.nb[1] = reshape->ne[0] * sizeof(float);
             src.nb[2] = x->nb[1];
             src.nb[3] = x->nb[2];
-            ggml_cuda_op_rms_norm_fused(*cuda_ctx, consumer, cgraph->nodes[j + 1], out, nullptr, &src);
+            // [-> RESHAPE -> ROPE(NEOX) -> ROUND]: rope the rounded rows in the same kernel.
+            static const bool no_norm_rope = getenv("GGML_CUDA_NO_NORM_ROPE_FUSION") != nullptr;
+            ggml_tensor * mul = cgraph->nodes[j + 1];
+            const ggml_tensor * mul_w = mul->src[0] == consumer ? mul->src[1] : mul->src[0];
+            if (!no_norm_rope && j + 5 < cgraph->n_nodes && ggml_cuda_is_elidable(cgraph, j + 2) &&
+                !(out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                const ggml_tensor * rs = cgraph->nodes[j + 3];
+                ggml_tensor * rope = cgraph->nodes[j + 4];
+                if (rs->op == GGML_OP_RESHAPE && rs->src[0] == out && ggml_node_get_use_count(cgraph, j + 3) == 1 &&
+                    !(rs->flags & GGML_TENSOR_FLAG_OUTPUT) && rope->op == GGML_OP_ROPE && rope->src[0] == rs &&
+                    rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope) &&
+                    ((const int32_t *) rope->op_params)[2] == GGML_ROPE_TYPE_NEOX && ggml_cuda_is_elidable(cgraph, j + 4) &&
+                    !(rope->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_is_round_bf16_of(cgraph, j + 5, rope) &&
+                    rope->ne[0] == reshape->ne[0] && rope->ne[0] <= 2*CUDA_ROPE_BLOCK_SIZE && rope->ne[0] < 1024 &&
+                    mul_w->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_w) && ggml_nelements(mul_w) == rope->ne[0]) {
+                    ggml_tensor * rope_out = cgraph->nodes[j + 5];
+                    if (!ggml_cuda_ranges_overlap(rope_out, x) && !ggml_cuda_ranges_overlap(rope_out, mul_w) &&
+                        !ggml_cuda_ranges_overlap(rope_out, rope->src[1]) &&
+                        (rope->src[2] == nullptr || !ggml_cuda_ranges_overlap(rope_out, rope->src[2]))) {
+                        ggml_cuda_op_round_rms_norm_rope(*cuda_ctx, &src, consumer, mul_w, rope, rope_out);
+                        return j + 5 - i;
+                    }
+                }
+            }
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, consumer, mul, out, nullptr, &src);
             return j + 2 - i;
         }
     }
