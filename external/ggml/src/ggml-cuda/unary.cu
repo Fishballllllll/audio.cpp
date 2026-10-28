@@ -1,4 +1,5 @@
 #include "unary.cuh"
+#include "prequant-q8.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -478,11 +479,12 @@ void ggml_cuda_op_round_bf16_to_f16(ggml_backend_cuda_context & ctx, const ggml_
 
 // ROUND(gate) -> SILU -> ROUND, ROUND(up), MUL -> ROUND in one pass. gate and up
 // may be strided row views (e.g. the halves of a packed gate_up projection).
+template <bool do_q8>
 static __global__ void swiglu_round_bf16_kernel(
     const char * gate, const char * up, float * dst, const int64_t k,
     const int64_t ne0, const int64_t ne1, const int64_t ne2,
     const int64_t g_nb1, const int64_t g_nb2, const int64_t g_nb3,
-    const int64_t u_nb1, const int64_t u_nb2, const int64_t u_nb3) {
+    const int64_t u_nb1, const int64_t u_nb2, const int64_t u_nb3, block_q8_1 * q8) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
@@ -497,11 +499,15 @@ static __global__ void swiglu_round_bf16_kernel(
     const float g = op_round_bf16(((const float *) (gate + i1*g_nb1 + i2*g_nb2 + i3*g_nb3))[i0]);
     const float u = op_round_bf16(((const float *) (up   + i1*u_nb1 + i2*u_nb2 + i3*u_nb3))[i0]);
     const float s = op_round_bf16(op_silu(g));
-    dst[i] = op_round_bf16(s * u);
+    const float out = op_round_bf16(s * u);
+    dst[i] = out;
+    if constexpr (do_q8) {
+        prequant_q8_1_store(out, q8, i);
+    }
 }
 
 void ggml_cuda_op_swiglu_round_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
-                                    ggml_tensor * dst) {
+                                    ggml_tensor * dst, void * q8) {
     GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, dst));
@@ -509,10 +515,43 @@ void ggml_cuda_op_swiglu_round_bf16(ggml_backend_cuda_context & ctx, const ggml_
     const int64_t k = ggml_nelements(dst);
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     GGML_ASSERT(num_blocks < UINT_MAX);
-    swiglu_round_bf16_kernel<<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
-        (const char *) gate->data, (const char *) up->data, (float *) dst->data, k,
-        dst->ne[0], dst->ne[1], dst->ne[2],
-        gate->nb[1], gate->nb[2], gate->nb[3], up->nb[1], up->nb[2], up->nb[3]);
+    if (q8 != nullptr) {
+        GGML_ASSERT(k % QK8_1 == 0);
+        swiglu_round_bf16_kernel<true><<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const char *) gate->data, (const char *) up->data, (float *) dst->data, k,
+            dst->ne[0], dst->ne[1], dst->ne[2],
+            gate->nb[1], gate->nb[2], gate->nb[3], up->nb[1], up->nb[2], up->nb[3], (block_q8_1 *) q8);
+    } else {
+        swiglu_round_bf16_kernel<false><<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const char *) gate->data, (const char *) up->data, (float *) dst->data, k,
+            dst->ne[0], dst->ne[1], dst->ne[2],
+            gate->nb[1], gate->nb[2], gate->nb[3], up->nb[1], up->nb[2], up->nb[3], nullptr);
+    }
+}
+
+// ROUND_BF16 of a contiguous x, also written as q8_1 rows for mul_mat_vec_q.
+static __global__ void round_bf16_q8_1_kernel(const float * x, float * dst, block_q8_1 * q8, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const float out = op_round_bf16(x[i]);
+    dst[i] = out;
+    prequant_q8_1_store(out, q8, i);
+}
+
+void ggml_cuda_op_round_bf16_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * dst, void * q8) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(x) == ggml_nelements(dst) && q8 != nullptr);
+
+    const int64_t k = ggml_nelements(dst);
+    GGML_ASSERT(k % QK8_1 == 0);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    round_bf16_q8_1_kernel<<<(unsigned int) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) x->data, (float *) dst->data, (block_q8_1 *) q8, k);
 }
 
 void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

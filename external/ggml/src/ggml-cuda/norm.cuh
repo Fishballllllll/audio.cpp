@@ -17,10 +17,11 @@ void ggml_cuda_op_rms_norm_channels_add_bias_silu(ggml_backend_cuda_context & ct
 // kernel; the residual is still stored (later layers read it).
 void ggml_cuda_op_round_add_round_rms_norm_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * res_x,
                                                  const ggml_tensor * res_other, bool x_first, ggml_tensor * residual,
-                                                 ggml_tensor * rms, ggml_tensor * mul_tensor, ggml_tensor * round_tensor);
+                                                 ggml_tensor * rms, ggml_tensor * mul_tensor, ggml_tensor * round_tensor,
+                                                 void * q8 = nullptr);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
-                                 ggml_tensor * round_bf16_tensor = nullptr);
+                                 ggml_tensor * round_bf16_tensor = nullptr, void * q8 = nullptr);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,

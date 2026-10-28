@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/prequant-q8.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -4308,6 +4309,54 @@ static bool ggml_cuda_can_fuse_swiglu_round_bf16(const ggml_cgraph * cgraph, int
     return !ggml_cuda_ranges_overlap(dst, gate) && !ggml_cuda_ranges_overlap(dst, up);
 }
 
+// The MUL_MAT reading node i_out (through RESHAPEs only) when it will run on
+// mul_mat_vec_q with q8_0 weights and unpadded rows: then the kernel producing
+// node i_out can write the q8_1 rows mmvq would otherwise quantize separately.
+static const ggml_tensor * ggml_cuda_prequant_q8_1_consumer(const ggml_cgraph * cgraph, int i_out) {
+    static const bool disabled = getenv("GGML_CUDA_NO_PREQUANT_Q8") != nullptr;
+    if (disabled) {
+        return nullptr;
+    }
+    const ggml_tensor * out = cgraph->nodes[i_out];
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || ggml_node_get_use_count(cgraph, i_out) != 1) {
+        return nullptr;
+    }
+    const ggml_tensor * chain = out;
+    for (int j = i_out + 1; j < cgraph->n_nodes && j <= i_out + 4; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == chain) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return nullptr;
+            }
+            chain = n;
+            continue;
+        }
+        if (n->op != GGML_OP_MUL_MAT || n->src[1] != chain || chain == out) {
+            return nullptr;
+        }
+        const ggml_tensor * w = n->src[0];
+        // The conditions under which ggml_cuda_mul_mat picks mul_mat_vec_q.
+        const bool usable = w->type == GGML_TYPE_Q8_0 && w->buffer != nullptr && !ggml_backend_buft_is_cuda_split(w->buffer->buft) &&
+            ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            n->type == GGML_TYPE_F32 && ggml_is_contiguous(chain) && chain->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+            chain->ne[2] == 1 && chain->ne[3] == 1 && chain->ne[0] % MATRIX_ROW_PADDING == 0;
+        return usable ? n : nullptr;
+    }
+    return nullptr;
+}
+
+// Pool rows for the consumer's src1 as q8_1, registered for its mul_mat_vec_q.
+static void * ggml_cuda_prequant_q8_1_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * consumer) {
+    const ggml_tensor * src1 = consumer->src[1];
+    auto & slot = ggml_cuda_prequant_q8_1_slot();
+    slot = {};
+    slot.rows = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(src1) / QK8_1 * sizeof(block_q8_1));
+    slot.ctx = &ctx;
+    slot.weights = consumer->src[0];
+    slot.src1 = src1->data;
+    return slot.rows->get();
+}
+
 static bool ggml_cuda_is_metadata_op(const ggml_tensor * t) {
     return t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
            t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
@@ -4363,8 +4412,10 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
                     if (ggml_cuda_check_fusion_memory_ranges(cgraph, i + 3, 3, outputs, 1) && ggml_is_contiguous(out) &&
                         ggml_nelements(out) == ggml_nelements(dst) && same_or_apart(x) && same_or_apart(other) &&
                         same_or_apart(dst)) {
+                        const ggml_tensor * mm = ggml_cuda_prequant_q8_1_consumer(cgraph, i + 5);
                         ggml_cuda_op_round_add_round_rms_norm_fused(*cuda_ctx, x, other, x_first, dst,
-                                                                    cgraph->nodes[i + 3], cgraph->nodes[i + 4], out);
+                                                                    cgraph->nodes[i + 3], cgraph->nodes[i + 4], out,
+                                                                    mm != nullptr ? ggml_cuda_prequant_q8_1_rows(*cuda_ctx, mm) : nullptr);
                         return 5;
                     }
                 }
@@ -4445,6 +4496,14 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
             ggml_cuda_op_round_rope_round_bf16(*cuda_ctx, consumer, &src, &out);
             return last - i;
         }
+    }
+
+    // (e) ROUND(x) -> RESHAPE -> MUL_MAT on mul_mat_vec_q with q8_0 weights: write the rounded
+    //     values with their q8_1 rows, so mmvq skips its quantization; the RESHAPEs are no-ops.
+    if (consumer->op == GGML_OP_MUL_MAT && ggml_is_contiguous(x) && ggml_nelements(x) == ggml_nelements(round) &&
+        !ggml_cuda_ranges_overlap(round, x) && ggml_cuda_prequant_q8_1_consumer(cgraph, i) == consumer) {
+        ggml_cuda_op_round_bf16_q8_1(*cuda_ctx, x, round, ggml_cuda_prequant_q8_1_rows(*cuda_ctx, consumer));
+        return 1;
     }
 
     // (d) ROUND(x) -> RESHAPE -> CPY(f16): the f16 V state, one kernel.
@@ -4650,7 +4709,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_is_elidable(cgraph, i + 1) && ggml_cuda_is_round_bf16_of(cgraph, i + 2, cgraph->nodes[i + 1])) {
         const int outputs[] = { i + 2 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, outputs, 1)) {
-            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            const ggml_tensor * mm = ggml_cuda_prequant_q8_1_consumer(cgraph, i + 2);
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                        mm != nullptr ? ggml_cuda_prequant_q8_1_rows(*cuda_ctx, mm) : nullptr);
             return 2;
         }
     }
@@ -4672,7 +4733,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     if (cuda_ctx->round_bf16_fusion && node->op == GGML_OP_UNARY &&
         ggml_get_unary_op(node) == GGML_UNARY_OP_ROUND_BF16 && ggml_cuda_can_fuse_swiglu_round_bf16(cgraph, i)) {
-        ggml_cuda_op_swiglu_round_bf16(*cuda_ctx, node->src[0], cgraph->nodes[i + 3], cgraph->nodes[i + 6]);
+        const ggml_tensor * mm = ggml_cuda_prequant_q8_1_consumer(cgraph, i + 6);
+        ggml_cuda_op_swiglu_round_bf16(*cuda_ctx, node->src[0], cgraph->nodes[i + 3], cgraph->nodes[i + 6],
+                                       mm != nullptr ? ggml_cuda_prequant_q8_1_rows(*cuda_ctx, mm) : nullptr);
         return 6;
     }
     if (cuda_ctx->round_bf16_fusion && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ROUND_BF16) {
@@ -5178,6 +5241,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    // No q8_1 rows carry over from another graph.
+    ggml_cuda_prequant_q8_1_slot() = {};
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5401,6 +5466,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
         }
+        // Registered q8_1 rows are only valid within this graph.
+        ggml_cuda_prequant_q8_1_slot() = {};
 
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);

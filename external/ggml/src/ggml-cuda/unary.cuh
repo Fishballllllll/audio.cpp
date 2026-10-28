@@ -107,8 +107,12 @@ void ggml_cuda_op_round_add_round_bf16(ggml_backend_cuda_context & ctx, const gg
 void ggml_cuda_op_round_bf16_to_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * dst);
 
 // ROUND_BF16(gate) -> SILU -> ROUND_BF16, ROUND_BF16(up), MUL -> ROUND_BF16; gate/up may be strided views.
+// q8, when set, also receives dst as q8_1 rows for mul_mat_vec_q (see prequant-q8.cuh).
 void ggml_cuda_op_swiglu_round_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
-                                    ggml_tensor * dst);
+                                    ggml_tensor * dst, void * q8 = nullptr);
+
+// ROUND_BF16(x) into dst, also written as q8_1 rows into q8 (see prequant-q8.cuh).
+void ggml_cuda_op_round_bf16_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * dst, void * q8);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
