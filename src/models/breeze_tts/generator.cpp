@@ -1475,6 +1475,12 @@ struct BreezeGeneratorRuntime::Impl {
         engine::debug::trace_log_scalar("breeze_tts.backbone_batched_cfg", backbone_batched_cfg);
         pipelined_frames = cuda && perf.pipelined_frames;
         engine::debug::trace_log_scalar("breeze_tts.pipelined_frames", pipelined_frames);
+        if (pipelined_frames) {
+            // The codec decodes on its own default-priority stream; let the frame's
+            // graphs go first when both have work. Streams are created lazily, so
+            // this takes effect as long as nothing has run on the backend yet.
+            core::set_backend_stream_priority(execution.backend(), -5);
+        }
         const auto codec_storage_type = std::getenv("TMP_CODEC_NATIVE") ? assets::TensorStorageType::Native : storage_type; // TMPDIAG
         speech_encoder = std::make_unique<BreezeSpeechEncoderRuntime>(
             this->assets,
@@ -2031,8 +2037,14 @@ struct BreezeGeneratorRuntime::Impl {
         float * noise[2] = {nullptr, nullptr};
         int32_t * codes_host = nullptr;      // [num_codebooks]
         int32_t * first_token = nullptr;
+        BreezeGate gate;                     // empty when the device cannot map pinned memory
+        bool gated = false;
+        unsigned int ticket = 0;
+        void * event = nullptr;              // marks the end of a frame's readback
 
         ~PipelineBuffers() {
+            breeze_event_destroy(event);
+            breeze_gate_destroy(gate);
             if (host != nullptr) {
                 ggml_backend_buffer_free(host);
             }
@@ -2081,6 +2093,8 @@ struct BreezeGeneratorRuntime::Impl {
         if (buffers->device == nullptr) {
             throw std::runtime_error("failed to allocate BreezeTTS pipelined frame scratch");
         }
+        buffers->gated = std::getenv("BREEZE_PIPELINE_NO_GATE") == nullptr && breeze_gate_create(buffers->gate);
+        buffers->event = breeze_event_create();
         buffers->logits_floats = logits_floats;
         buffers->noise_floats = noise_floats;
         current = std::move(buffers);
@@ -2109,6 +2123,8 @@ struct BreezeGeneratorRuntime::Impl {
     // embedded there and the next backbone step is queued behind the depth graph.
     // The host reads back the logits and the codes once per frame, samples the
     // first codebook, and prepares the next frame's noise while the device runs.
+    // With a gate, the next frame's depth graph is queued as well, behind a wait
+    // for its first token, so launching that large graph overlaps the device.
     void run_pipelined_frames(BreezeSpeechCodes & captured, bool capture) {
 #if defined(ENGINE_HAS_BREEZE_CUDA_DEPTH)
         auto & state = *stream_;
@@ -2152,6 +2168,27 @@ struct BreezeGeneratorRuntime::Impl {
             sampling::torch_cuda_tensor_iterator_offset_blocks(static_cast<uint64_t>(config.vocab_size), sampling_policy);
         uint64_t noise_offset[2] = {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
         int slot = 0;
+        const bool gated = buffers.gated;
+        bool depth_queued = false;  // a gated depth graph is waiting for its first token
+        int queued_slot = 0;
+        unsigned int queued_ticket = 0;
+        // Queues the depth graph whose noise is (or will be, before the release) in noise_slot.
+        const auto queue_depth = [&](int noise_slot) {
+            queued_ticket = ++buffers.ticket;
+            breeze_gate_wait(stream, buffers.gate, queued_ticket, static_cast<int32_t *>(first_in->data));
+            ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[noise_slot], 0, noise_bytes);
+            fused_depth->enqueue();
+            depth_queued = true;
+            queued_slot = noise_slot;
+        };
+        // Lets a queued depth graph run (its tokens are discarded) and drains the stream.
+        const auto drain = [&] {
+            if (depth_queued) {
+                breeze_gate_release(buffers.gate, queued_ticket, 0);
+                depth_queued = false;
+            }
+            ggml_backend_synchronize(backend);
+        };
 
         BreezeFrameEmbedArgs embed;
         embed.vocab = config.vocab_size;
@@ -2208,14 +2245,24 @@ struct BreezeGeneratorRuntime::Impl {
                     continue;
                 }
                 const auto frame_start = Clock::now();
-                if (noise_offset[slot] != state.offset_blocks) {
-                    fused_depth->fill_noise(buffers.noise[slot], request, state.fallback_rng, sampling_policy, state.offset_blocks);
-                    noise_offset[slot] = state.offset_blocks;
+                const int use_slot = depth_queued ? queued_slot : slot;
+                // A pad draw moves the offset; a gated graph has not copied its noise yet.
+                if (noise_offset[use_slot] != state.offset_blocks) {
+                    fused_depth->fill_noise(buffers.noise[use_slot], request, state.fallback_rng, sampling_policy, state.offset_blocks);
+                    noise_offset[use_slot] = state.offset_blocks;
                 }
-                *buffers.first_token = first_token;
-                ggml_backend_tensor_set_async(backend, first_in, buffers.first_token, 0, sizeof(int32_t));
-                ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[slot], 0, noise_bytes);
-                fused_depth->enqueue();
+                if (gated) {
+                    if (!depth_queued) {
+                        queue_depth(use_slot);
+                    }
+                    breeze_gate_release(buffers.gate, queued_ticket, first_token);
+                    depth_queued = false;
+                } else {
+                    *buffers.first_token = first_token;
+                    ggml_backend_tensor_set_async(backend, first_in, buffers.first_token, 0, sizeof(int32_t));
+                    ggml_backend_tensor_set_async(backend, noise_in, buffers.noise[use_slot], 0, noise_bytes);
+                    fused_depth->enqueue();
+                }
                 // Advance the torch RNG stream past the depth draws, as generate_frame() does.
                 for (int codebook = 1; codebook < codebooks; ++codebook) {
                     ++state.sample_call_index;
@@ -2242,15 +2289,22 @@ struct BreezeGeneratorRuntime::Impl {
                 ggml_backend_tensor_get_async(backend, buffers.codes, buffers.codes_host, 0,
                                               static_cast<size_t>(codebooks) * sizeof(int32_t));
                 ggml_backend_tensor_get_async(backend, step.logits, buffers.logits, 0, 2 * logits_size * sizeof(float));
-                push_pending();
+                breeze_event_record(buffers.event, stream);
 
-                // Next frame's noise, assuming its first draw is not a pad; a pad
-                // moves the offset and the noise is recomputed above.
-                const int next = slot ^ 1;
+                // Next frame, assuming its first draw is not a pad (a pad moves the
+                // offset and the noise is recomputed above, before the release).
+                const int next = use_slot ^ 1;
                 const uint64_t next_offset = state.offset_blocks + first_blocks;
+                if (gated) {
+                    queue_depth(next);
+                }
+                push_pending();
                 fused_depth->fill_noise(buffers.noise[next], request, state.fallback_rng, sampling_policy, next_offset);
                 noise_offset[next] = next_offset;
-                ggml_backend_synchronize(backend);
+                breeze_event_synchronize(buffers.event);
+                if (gated && breeze_gate_failed(buffers.gate)) {
+                    throw std::runtime_error("BreezeTTS pipelined frames: the device gave up waiting for the host");
+                }
                 slot = next;
 
                 frame[0] = first_token;
@@ -2269,9 +2323,13 @@ struct BreezeGeneratorRuntime::Impl {
                 state.codes = frame;
                 has_pending = true;
             }
+            drain();
             push_pending();
         } catch (...) {
-            ggml_backend_synchronize(backend);
+            try {
+                drain();
+            } catch (...) {
+            }
             throw;
         }
 #else

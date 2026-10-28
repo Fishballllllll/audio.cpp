@@ -78,4 +78,92 @@ void breeze_copy_device_async(void * stream, void * dst, const void * src, size_
     check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)), "device copy");
 }
 
+namespace {
+
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+__global__ void gate_kernel(volatile unsigned long long * words, unsigned int ticket, int32_t * token_dst) {
+    const unsigned long long start = global_ns();
+    unsigned long long word = words[0];
+    // Tickets only grow; compare as a signed difference so a wrap is harmless.
+    while (static_cast<int>(static_cast<unsigned int>(word) - ticket) < 0) {
+        if (global_ns() - start > 10ull * 1000 * 1000 * 1000) {
+            words[1] = 1;
+            return;
+        }
+        __nanosleep(200);
+        word = words[0];
+    }
+    *token_dst = static_cast<int32_t>(static_cast<unsigned int>(word >> 32));
+}
+
+}  // namespace
+
+bool breeze_gate_create(BreezeGate & gate) {
+    gate = {};
+    void * host = nullptr;
+    if (cudaHostAlloc(&host, 2 * sizeof(unsigned long long), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    void * device = nullptr;
+    if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess || device == nullptr) {
+        cudaGetLastError();
+        cudaFreeHost(host);
+        return false;
+    }
+    gate.host = static_cast<unsigned long long *>(host);
+    gate.device = static_cast<unsigned long long *>(device);
+    gate.host[0] = 0;
+    gate.host[1] = 0;
+    return true;
+}
+
+void breeze_gate_destroy(BreezeGate & gate) {
+    if (gate.host != nullptr) {
+        cudaFreeHost(gate.host);
+    }
+    gate = {};
+}
+
+void breeze_gate_wait(void * stream, const BreezeGate & gate, unsigned int ticket, int32_t * token_dst) {
+    gate_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(gate.device, ticket, token_dst);
+    check(cudaGetLastError(), "gate launch");
+}
+
+void breeze_gate_release(const BreezeGate & gate, unsigned int ticket, int32_t token) {
+    // One 64-bit store: the device sees the ticket and its token together.
+    const unsigned long long word =
+        (static_cast<unsigned long long>(static_cast<unsigned int>(token)) << 32) | ticket;
+    __atomic_store_n(gate.host, word, __ATOMIC_RELEASE);
+}
+
+bool breeze_gate_failed(const BreezeGate & gate) {
+    return __atomic_load_n(gate.host + 1, __ATOMIC_ACQUIRE) != 0;
+}
+
+void * breeze_event_create() {
+    cudaEvent_t event = nullptr;
+    check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event create");
+    return event;
+}
+
+void breeze_event_destroy(void * event) {
+    if (event != nullptr) {
+        cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+}
+
+void breeze_event_record(void * event, void * stream) {
+    check(cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream)), "event record");
+}
+
+void breeze_event_synchronize(void * event) {
+    check(cudaEventSynchronize(static_cast<cudaEvent_t>(event)), "event synchronize");
+}
+
 }  // namespace engine::models::breeze_tts
