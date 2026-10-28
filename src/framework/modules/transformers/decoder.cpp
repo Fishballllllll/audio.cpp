@@ -10,6 +10,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <cstdlib> // TMPDIAG
+
 namespace engine::modules {
 namespace {
 
@@ -224,6 +226,13 @@ core::TensorValue cache_view(
         GGML_TYPE_F32);
 }
 
+core::TensorValue activation_cast(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const DecoderActivationCastPolicy & policy);
+
+// Ropes q and k ([batch, 1, heads, dim]) at positions [1] or [batch], then applies the
+// after_rope activation cast.
 void apply_batched_static_rope(
     core::ModuleBuildContext & ctx,
     const DecoderLayerConfig & config,
@@ -237,13 +246,35 @@ void apply_batched_static_rope(
         : nullptr;
     RoPEConfig rope{dim, config.rope_type, config.rope_theta};
     rope.intermediate_round_type = config.activation_cast.rope_intermediate_type;
+    const bool round_after = config.activation_cast.enabled && config.activation_cast.after_rope;
+    const auto cast_after = [&](core::TensorValue & t) {
+        if (round_after) {
+            t = activation_cast(ctx, t, config.activation_cast);
+        }
+    };
     if (positions.shape.rank == 1 && positions.shape.dims[0] == q.shape.dims[1]) {
         q = RoPEModule(rope).build(ctx, q, positions, rope_factors);
         k = RoPEModule(rope).build(ctx, k, positions, rope_factors);
+        cast_after(q);
+        cast_after(k);
         return;
     }
     if (q.shape.dims[1] != 1 || positions.shape.rank != 1 || positions.shape.dims[0] != q.shape.dims[0]) {
         throw std::runtime_error("Qwen decoder batched static-cache RoPE positions must be [1] or [batch]");
+    }
+    if (ggml_is_contiguous(q.tensor) && ggml_is_contiguous(k.tensor) && std::getenv("TMP_NO_LANE_ROPE") == nullptr) { // TMPDIAG env
+        // View the lanes as tokens: one RoPE then applies each lane its own position, the
+        // same per-element math as roping every lane on its own and concatenating.
+        const auto lanes_as_tokens = [&](core::TensorValue & t) {
+            const auto shape = t.shape;
+            t = core::reshape_tensor(ctx, t, core::TensorShape::from_dims({1, shape.dims[0], shape.dims[2], shape.dims[3]}));
+            t = RoPEModule(rope).build(ctx, t, positions, rope_factors);
+            cast_after(t);
+            t = core::reshape_tensor(ctx, t, shape);
+        };
+        lanes_as_tokens(q);
+        lanes_as_tokens(k);
+        return;
     }
     std::vector<core::TensorValue> q_rows;
     std::vector<core::TensorValue> k_rows;
@@ -262,6 +293,8 @@ void apply_batched_static_rope(
     }
     q = concat_all(ctx, q_rows, 0);
     k = concat_all(ctx, k_rows, 0);
+    cast_after(q);
+    cast_after(k);
 }
 
 LinearWeights require_linear(const LinearWeights & weights, bool use_bias, const char * name) {
@@ -1046,10 +1079,6 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
 
     if (config_.position_encoding == DecoderPositionEncoding::Rotary) {
         apply_batched_static_rope(ctx, config_, weights, positions, q, k, dim);
-        if (config_.activation_cast.enabled && config_.activation_cast.after_rope) {
-            q = activation_cast(ctx, q, config_.activation_cast);
-            k = activation_cast(ctx, k, config_.activation_cast);
-        }
     }
     k = core::ensure_backend_addressable_layout(ctx, k);
     v = core::ensure_backend_addressable_layout(ctx, v);
@@ -1072,8 +1101,16 @@ DecoderLayerOutputs DecoderLayerModule::build_with_static_cache_tail_batched(
         attention_value_cache = SliceModule({1, 0, attention_steps}).build(ctx, attention_value_cache);
     }
 
-    auto q_heads = TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
-    q_heads = core::wrap_tensor(ggml_cont(ctx.ggml, q_heads.tensor), q_heads.shape, q_heads.type);
+    core::TensorValue q_heads;
+    if (q.shape.dims[1] == 1 && ggml_is_contiguous(q.tensor) && std::getenv("TMP_NO_QHEADS_RESHAPE") == nullptr) { // TMPDIAG env
+        // One token: swapping it with the heads moves nothing, so the contiguous
+        // transpose is this same memory; view it instead of copying it.
+        q_heads = core::reshape_tensor(
+            ctx, q, core::TensorShape::from_dims({q.shape.dims[0], q.shape.dims[2], 1, q.shape.dims[3]}));
+    } else {
+        q_heads = TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
+        q_heads = core::wrap_tensor(ggml_cont(ctx.ggml, q_heads.tensor), q_heads.shape, q_heads.type);
+    }
     auto k_heads = TransposeModule({{0, 2, 1, 3}, attention_key_cache.shape.rank}).build(ctx, attention_key_cache);
     auto v_heads = TransposeModule({{0, 2, 1, 3}, attention_value_cache.shape.rank}).build(ctx, attention_value_cache);
     core::TensorValue context;
