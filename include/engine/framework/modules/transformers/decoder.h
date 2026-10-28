@@ -145,6 +145,17 @@ struct DecoderLayerWeights {
     std::optional<core::TensorValue> rope_frequency_factors;
 };
 
+// A K/V cache a layer updates in place instead of concatenating a prefix: the
+// step's f16 K/V go to positions [position, position + tokens) and attention
+// reads positions [0, position + tokens). Each tensor is f16
+// [head_dim, kv_heads, batch, capacity], positions outermost, so one new position
+// across the batch is a single contiguous block.
+struct DecoderKVStore {
+    ggml_tensor * key = nullptr;
+    ggml_tensor * value = nullptr;
+    int64_t position = 0;
+};
+
 struct DecoderLayerOutputs {
     core::TensorValue output;
     core::TensorValue key;
@@ -168,7 +179,8 @@ public:
         const DecoderLayerWeights & weights,
         const std::optional<core::TensorValue> & prefix_key = std::nullopt,
         const std::optional<core::TensorValue> & prefix_value = std::nullopt,
-        const std::optional<core::TensorValue> & attention_mask = std::nullopt) const;
+        const std::optional<core::TensorValue> & attention_mask = std::nullopt,
+        const DecoderKVStore * kv_store = nullptr) const;
 
     DecoderLayerOutputs build_with_static_cache_tail(
         core::ModuleBuildContext & ctx,
@@ -250,6 +262,8 @@ struct DecoderStackLayerState {
     std::optional<core::TensorValue> value;
     std::optional<core::TensorValue> attended_key;
     std::optional<core::TensorValue> attended_value;
+    // When set, the layer updates this cache in place (key/value stay unset).
+    std::optional<DecoderKVStore> kv_store;
 };
 
 struct DecoderStackState {

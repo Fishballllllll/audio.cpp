@@ -860,6 +860,11 @@ public:
         // K/V state in f16 instead (same values, no per-step conversion of the prefix).
         hidden_config_.stack.runtime.attention.flash_kv_f16 =
             backend_type_ == core::BackendType::Cuda && getenv("TMP_NO_KV_F16") == nullptr; // TMPDIAG env
+        // With f16 flash K/V, each step writes its K/V into a per-layer cache in
+        // place instead of concatenating the prefix again (same values, no copies).
+        kv_store_ = hidden_config_.stack.runtime.attention.flash_kv_f16 &&
+                    hidden_config_.stack.runtime.attention.prefix_mode == modules::DecoderPrefixAttentionMode::FlashWithPrefix &&
+                    getenv("TMP_NO_KV_STORE") == nullptr; // TMPDIAG env
         hidden_weights_.stack = weights.depth.stack;
         hidden_weights_.final_norm = weights.depth.final_norm;
         // The CPU path embeds from the f32 table. Reuse the device copy when it
@@ -1183,6 +1188,8 @@ private:
         inputs_ctx_.reset();
         masks_in_.clear();
         open_masks_in_.clear();
+        kv_keys_.clear();
+        kv_values_.clear();
         tokens_out_.clear();
     }
 
@@ -1197,7 +1204,8 @@ private:
 
         // Graph inputs live in their own buffer so the graph allocator never
         // reuses them; positions and masks are uploaded once per build.
-        inputs_ctx_.reset(ggml_init({ggml_tensor_overhead() * static_cast<size_t>(2 * steps + 8), nullptr, true}));
+        const int64_t layers = hidden_config_.stack.layers;
+        inputs_ctx_.reset(ggml_init({ggml_tensor_overhead() * static_cast<size_t>(2 * steps + 2 * layers + 8), nullptr, true}));
         if (inputs_ctx_ == nullptr) {
             throw std::runtime_error("failed to initialize BreezeTTS fused depth input context");
         }
@@ -1210,6 +1218,15 @@ private:
         }
         for (int64_t length = 2; length <= steps + 1; ++length) {
             open_masks_in_.push_back(ggml_new_tensor_4d(inputs_ctx_.get(), GGML_TYPE_F16, length, 1, 1, batch));
+        }
+        if (kv_store_) {
+            // Every position read in a frame is written earlier in the same frame.
+            for (int64_t layer = 0; layer < layers; ++layer) {
+                for (auto * list : {&kv_keys_, &kv_values_}) {
+                    list->push_back(ggml_new_tensor_4d(inputs_ctx_.get(), GGML_TYPE_F16, hidden_config_.stack.head_dim,
+                                                       hidden_config_.stack.num_key_value_heads, batch, steps + 1));
+                }
+            }
         }
         for (ggml_tensor * tensor = ggml_get_first_tensor(inputs_ctx_.get()); tensor != nullptr;
              tensor = ggml_get_next_tensor(inputs_ctx_.get(), tensor)) {
@@ -1282,6 +1299,15 @@ private:
                     core::TensorShape::from_dims({batch, 1, length, length}),
                     GGML_TYPE_F16);
             }
+            std::optional<modules::DecoderStackState> step_state = cached ? state : std::nullopt;
+            if (kv_store_) {
+                modules::DecoderStackState stored;
+                stored.layers.resize(kv_keys_.size());
+                for (size_t layer = 0; layer < kv_keys_.size(); ++layer) {
+                    stored.layers[layer].kv_store = modules::DecoderKVStore{kv_keys_[layer], kv_values_[layer], cached ? codebook : 0};
+                }
+                step_state = std::move(stored);
+            }
             auto out = modules::DecoderHiddenModule(hidden_config_).build(
                 ctx,
                 core::wrap_tensor(sequence, core::TensorShape::from_dims({batch, step_tokens, depth_hidden})),
@@ -1291,9 +1317,11 @@ private:
                     core::TensorShape::from_dims({step_tokens}),
                     GGML_TYPE_I32),
                 hidden_weights_,
-                cached ? state : std::nullopt,
+                step_state,
                 mask);
-            if (!cached) {
+            if (kv_store_) {
+                // The caches already hold every step's K/V.
+            } else if (!cached) {
                 state = out.state;
             } else {
                 for (size_t layer = 0; layer < state->layers.size(); ++layer) {
@@ -1406,6 +1434,9 @@ private:
     ggml_tensor * positions_in_ = nullptr;
     std::vector<ggml_tensor *> masks_in_;
     std::vector<ggml_tensor *> open_masks_in_;
+    bool kv_store_ = false;
+    std::vector<ggml_tensor *> kv_keys_;    // per layer, [head_dim, kv_heads, batch, steps + 1] f16
+    std::vector<ggml_tensor *> kv_values_;
     std::vector<ggml_tensor *> tokens_out_;
     std::vector<float> noise_staging_;
     Key key_;

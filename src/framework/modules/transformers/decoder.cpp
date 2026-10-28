@@ -544,10 +544,14 @@ DecoderLayerOutputs DecoderLayerModule::build(
     const DecoderLayerWeights & weights,
     const std::optional<core::TensorValue> & prefix_key,
     const std::optional<core::TensorValue> & prefix_value,
-    const std::optional<core::TensorValue> & attention_mask) const {
+    const std::optional<core::TensorValue> & attention_mask,
+    const DecoderKVStore * kv_store) const {
     validate_sequence_input(input, config_.hidden_size, "input");
     if (prefix_key.has_value() != prefix_value.has_value()) {
         throw std::runtime_error("Qwen decoder layer requires both prefix_key and prefix_value or neither");
+    }
+    if (kv_store != nullptr && prefix_key.has_value()) {
+        throw std::runtime_error("Qwen decoder layer takes a prefix or an in-place K/V store, not both");
     }
 
     const int64_t dim = require_head_dim(config_);
@@ -614,12 +618,44 @@ DecoderLayerOutputs DecoderLayerModule::build(
          (!prefix_key.has_value() &&
           (config_.runtime.attention.prefill_mode == DecoderAttentionMode::FlashGroupedViewKV ||
            config_.runtime.attention.prefill_mode == DecoderAttentionMode::FlashGrouped)));
-    if (config_.runtime.attention.flash_kv_f16 && flash_branch && k.type == GGML_TYPE_F32 && v.type == GGML_TYPE_F32) {
+    if (kv_store != nullptr) {
+        const int64_t batch = input.shape.dims[0];
+        const int64_t length = kv_store->position + input.shape.dims[1];
+        const auto valid = [&](const ggml_tensor * cache) {
+            return cache != nullptr && cache->type == GGML_TYPE_F16 && ggml_is_contiguous(cache) && cache->ne[0] == dim &&
+                   cache->ne[1] == config_.num_key_value_heads && cache->ne[2] == batch && cache->ne[3] >= length;
+        };
+        // The store holds the same f16 values the flash_kv_f16 cast would produce.
+        if (!config_.runtime.attention.flash_kv_f16 || !flash_branch || k.type != GGML_TYPE_F32 ||
+            v.type != GGML_TYPE_F32 || kv_store->position < 0 || !valid(kv_store->key) || !valid(kv_store->value)) {
+            throw std::runtime_error("Qwen decoder in-place K/V store needs f16 flash K/V and a matching cache");
+        }
+    } else if (config_.runtime.attention.flash_kv_f16 && flash_branch && k.type == GGML_TYPE_F32 && v.type == GGML_TYPE_F32) {
         k = core::wrap_tensor(ggml_cast(ctx.ggml, k.tensor, GGML_TYPE_F16), k.shape, GGML_TYPE_F16);
         v = core::wrap_tensor(ggml_cast(ctx.ggml, v.tensor, GGML_TYPE_F16), v.shape, GGML_TYPE_F16);
     }
     core::TensorValue all_k = k;
     core::TensorValue all_v = v;
+    if (kv_store != nullptr) {
+        const int64_t batch = input.shape.dims[0];
+        const int64_t tokens = input.shape.dims[1];
+        const int64_t length = kv_store->position + tokens;
+        // [dim, kv_heads, count, batch] over positions [start, start + count).
+        const auto rows = [&](ggml_tensor * cache, int64_t start, int64_t count) {
+            return ggml_view_4d(ctx.ggml, cache, dim, config_.num_key_value_heads, count, batch,
+                                cache->nb[1], cache->nb[3], cache->nb[2], static_cast<size_t>(start) * cache->nb[3]);
+        };
+        ggml_tensor * k_written = ggml_cpy(ctx.ggml, k.tensor, rows(kv_store->key, kv_store->position, tokens));
+        ggml_tensor * v_written = ggml_cpy(ctx.ggml, v.tensor, rows(kv_store->value, kv_store->position, tokens));
+        ggml_tensor * k_rows = rows(kv_store->key, 0, length);
+        ggml_tensor * v_rows = rows(kv_store->value, 0, length);
+        // A view computes nothing; the extra source only orders the reads after this step's writes.
+        k_rows->src[1] = k_written;
+        v_rows->src[1] = v_written;
+        const auto shape = core::TensorShape::from_dims({batch, length, config_.num_key_value_heads, dim});
+        all_k = core::wrap_tensor(k_rows, shape, GGML_TYPE_F16);
+        all_v = core::wrap_tensor(v_rows, shape, GGML_TYPE_F16);
+    }
     // Cached prefix KV may be stored in a different dtype than the current
     // K/V (e.g. Higgs reference state); cast before concat on every path.
     // (The eager branch previously skipped this and died in ggml_concat.)
@@ -1170,7 +1206,8 @@ DecoderStackOutputs DecoderStackModule::build(
             weights.layers[layer_index],
             layer_prefix != nullptr ? layer_prefix->key : std::nullopt,
             layer_prefix != nullptr ? layer_prefix->value : std::nullopt,
-            attention_mask);
+            attention_mask,
+            layer_prefix != nullptr && layer_prefix->kv_store.has_value() ? &*layer_prefix->kv_store : nullptr);
         output = layer.output;
         state.layers.push_back({layer.key, layer.value, layer.attended_key, layer.attended_value});
     }
