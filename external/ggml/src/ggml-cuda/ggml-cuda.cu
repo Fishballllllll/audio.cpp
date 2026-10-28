@@ -4362,6 +4362,215 @@ static bool ggml_cuda_is_metadata_op(const ggml_tensor * t) {
            t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
 }
 
+// The checks on a ROUND_BF16 node shared by its consumer fusions.
+static bool ggml_cuda_round_head_ok(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * round = cgraph->nodes[i];
+    const ggml_tensor * x = round->src[0];
+    return round->op == GGML_OP_UNARY && ggml_get_unary_op(round) == GGML_UNARY_OP_ROUND_BF16 &&
+           round->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && ggml_is_contiguous(round) &&
+           ggml_cuda_is_elidable(cgraph, i) && !(round->flags & GGML_TENSOR_FLAG_OUTPUT);
+}
+
+// The ROUND at node i read through a chain of RESHAPEs, each used once; unrelated metadata
+// nodes (e.g. position views) may sit in between and are no-ops anyway. RESHAPE/PERMUTE are
+// views, which ggml_node_has_n_uses() always rejects, so their own use counts are checked
+// directly (the ROUND they view is checked by ggml_cuda_round_head_ok). Returns the index of
+// the node consuming the last RESHAPE, stored in *reshape_out, or -1.
+static int ggml_cuda_round_reshape_consumer(ggml_cgraph * cgraph, int i, const ggml_tensor ** reshape_out) {
+    const ggml_tensor * round = cgraph->nodes[i];
+    int j = i + 1;
+    const ggml_tensor * reshape = nullptr;
+    const ggml_tensor * chain_end = round;
+    for (; j < cgraph->n_nodes && j <= i + 8; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == chain_end) {
+            if (ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return -1;
+            }
+            reshape = chain_end = n;
+            continue;
+        }
+        if (ggml_cuda_is_metadata_op(n) && n->src[0] != chain_end) {
+            continue;
+        }
+        break;
+    }
+    if (reshape == nullptr || j >= cgraph->n_nodes) {
+        return -1;
+    }
+    *reshape_out = reshape;
+    return j;
+}
+
+// A ROUND chain of fusion (b) or (d) below, found without launching anything.
+struct ggml_cuda_round_chain {
+    int                 last = 0;       // index of the chain's last node
+    ggml_tensor *       rope = nullptr; // (b): the ROPE node
+    ggml_tensor         src;            // (b): the unrounded rope input, a view of x
+    ggml_tensor         out;            // (b): where the rounded rope result is written
+    const ggml_tensor * x    = nullptr; // the ROUND's input
+    ggml_tensor *       dst  = nullptr; // (d): the f16 CPY node
+};
+
+// (b) for the ROUND at node i whose RESHAPE chain ends in reshape, consumed at node j.
+static bool ggml_cuda_round_rope_chain(ggml_cgraph * cgraph, int i, int j, const ggml_tensor * reshape,
+                                       ggml_cuda_round_chain & res) {
+    const ggml_tensor * x = cgraph->nodes[i]->src[0];
+    ggml_tensor * consumer = cgraph->nodes[j];
+    if (consumer->op == GGML_OP_ROPE && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F32 &&
+        ((const int32_t *) consumer->op_params)[2] == GGML_ROPE_TYPE_NEOX && ggml_is_contiguous(consumer) &&
+        ggml_cuda_is_elidable(cgraph, j) && !(consumer->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        ggml_cuda_is_round_bf16_of(cgraph, j + 1, consumer) && x->nb[0] == sizeof(float) &&
+        x->ne[0] == reshape->ne[0] * reshape->ne[1] && x->ne[1] == reshape->ne[2] && x->ne[2] == reshape->ne[3] &&
+        x->ne[3] == 1) {
+        // The rope input [d, h, t, b] is x[d + h*ne0, t, b].
+        ggml_tensor src = *reshape;
+        src.data  = x->data;
+        src.nb[0] = sizeof(float);
+        src.nb[1] = reshape->ne[0] * sizeof(float);
+        src.nb[2] = x->nb[1];
+        src.nb[3] = x->nb[2];
+        ggml_tensor * round_out = cgraph->nodes[j + 1];
+        ggml_tensor out = *round_out;
+        int last = j + 1;
+        if (j + 3 < cgraph->n_nodes && ggml_cuda_is_elidable(cgraph, j + 1) && !(round_out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * perm = cgraph->nodes[j + 2];
+            const ggml_tensor * cont = cgraph->nodes[j + 3];
+            const int32_t * axes = (const int32_t *) perm->op_params;
+            if (perm->op == GGML_OP_PERMUTE && perm->src[0] == round_out && ggml_node_get_use_count(cgraph, j + 2) == 1 &&
+                !(perm->flags & GGML_TENSOR_FLAG_OUTPUT) && axes[0] == 0 && cont->op == GGML_OP_CONT &&
+                cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
+                (cont->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                // Source dim d lands in dim axes[d] of the permute, and so of the CONT.
+                out.data = cont->data;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    out.nb[d] = cont->nb[axes[d]];
+                }
+                last = j + 3;
+            }
+            // [-> CPY(f16)]: an f16 K/V state; write the rounded values cast to f16. The
+            // CPY's destination view (a row of a K/V cache) may sit just before it.
+            int c = j + 2;
+            if (cgraph->nodes[c]->op == GGML_OP_VIEW && cgraph->nodes[c]->src[0] != round_out) {
+                ++c;
+            }
+            ggml_tensor * cpy = cgraph->nodes[c];
+            if (last == j + 1 && cpy->op == GGML_OP_CPY && cpy->src[0] == round_out && cpy->type == GGML_TYPE_F16 &&
+                ggml_is_contiguous(cpy) && ggml_are_same_shape(cpy, round_out) && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                out = *cpy;
+                last = c;
+            }
+        }
+        const ggml_tensor * written = cgraph->nodes[last];
+        if (!ggml_cuda_ranges_overlap(written, x)) {
+            res.last = last;
+            res.rope = consumer;
+            res.src  = src;
+            res.out  = out;
+            res.x    = x;
+            res.dst  = nullptr;
+            return true;
+        }
+    }
+    return false;
+}
+
+// (d) for the ROUND at node i whose RESHAPE chain ends in reshape, consumed at node j.
+static bool ggml_cuda_round_f16_chain(ggml_cgraph * cgraph, int i, int j, const ggml_tensor * reshape,
+                                      ggml_cuda_round_chain & res) {
+    const ggml_tensor * x = cgraph->nodes[i]->src[0];
+    ggml_tensor * consumer = cgraph->nodes[j];
+    if (consumer->op == GGML_OP_CPY && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F16 &&
+        ggml_is_contiguous(consumer) && ggml_nelements(consumer) == ggml_nelements(x) && x->nb[0] == sizeof(float) &&
+        !ggml_cuda_ranges_overlap(consumer, x)) {
+        res.last = j;
+        res.rope = nullptr;
+        res.x    = x;
+        res.dst  = consumer;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_cuda_parse_round_chain(ggml_cgraph * cgraph, int i, ggml_cuda_round_chain & c) {
+    if (!ggml_cuda_round_head_ok(cgraph, i)) {
+        return false;
+    }
+    const ggml_tensor * reshape = nullptr;
+    const int j = ggml_cuda_round_reshape_consumer(cgraph, i, &reshape);
+    return j >= 0 && (ggml_cuda_round_rope_chain(cgraph, i, j, reshape, c) || ggml_cuda_round_f16_chain(cgraph, i, j, reshape, c));
+}
+
+// A node the evaluation loop does not launch anything for.
+static bool ggml_cuda_is_noop_node(const ggml_tensor * n) {
+    return ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_VIEW ||
+           n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE || !(n->flags & GGML_TENSOR_FLAG_COMPUTE);
+}
+
+// q, k and v sliced from one packed QKV projection each run a short chain: (b) for q (into the
+// attention layout) and k (into an f16 K cache row), (d) for v (into an f16 V cache row). Each is
+// a tiny kernel, so run the three as one. The chains must follow each other with only no-op nodes
+// in between, read the same packed projection and write outside every input and each other, so
+// running the later ones early changes nothing; the nodes up to the last chain's end are then all
+// done. first is the chain at node i. Returns the number of nodes to skip, or 0.
+static int ggml_cuda_try_fuse_round_qkv(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+                                        const ggml_cuda_round_chain & first) {
+    static const bool disabled = getenv("GGML_CUDA_NO_QKV_ROPE_FUSION") != nullptr;
+    if (disabled || !cuda_ctx->stream_context().concurrent_events.empty() || first.x->view_src == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * base = first.x->view_src;
+    ggml_cuda_round_chain found[3];
+    const ggml_cuda_round_chain * q = nullptr;
+    const ggml_cuda_round_chain * k = nullptr;
+    const ggml_cuda_round_chain * v = nullptr;
+    int n_found = 0;
+    const auto take = [&](const ggml_cuda_round_chain & c) {
+        const ggml_cuda_round_chain ** slot = c.rope == nullptr               ? &v :
+                                              c.out.type == GGML_TYPE_F32 ? &q :
+                                              c.out.type == GGML_TYPE_F16 ? &k : nullptr;
+        if (slot == nullptr || *slot != nullptr) {
+            return false;
+        }
+        found[n_found] = c;
+        *slot = &found[n_found++];
+        return true;
+    };
+    if (!take(first)) {
+        return 0;
+    }
+    int end = first.last;
+    for (int m = end + 1; m < cgraph->n_nodes && m <= end + 16 && n_found < 3; ++m) {
+        if (ggml_cuda_is_noop_node(cgraph->nodes[m])) {
+            continue;
+        }
+        ggml_cuda_round_chain c;
+        if (!ggml_cuda_parse_round_chain(cgraph, m, c) || c.x->view_src != base || !take(c)) {
+            return 0;
+        }
+        m = end = c.last;
+    }
+    if (n_found < 3 || q->rope->src[1] != k->rope->src[1] || (q->rope->src[2] == nullptr) != (k->rope->src[2] == nullptr) ||
+        q->src.ne[0] > 2*CUDA_ROPE_BLOCK_SIZE || k->src.ne[0] > 2*CUDA_ROPE_BLOCK_SIZE) {
+        return 0;
+    }
+    const ggml_tensor * written[3] = { cgraph->nodes[q->last], cgraph->nodes[k->last], v->dst };
+    for (int a = 0; a < 3; ++a) {
+        if (ggml_cuda_ranges_overlap(written[a], base) || ggml_cuda_ranges_overlap(written[a], q->rope->src[1]) ||
+            (q->rope->src[2] != nullptr && ggml_cuda_ranges_overlap(written[a], q->rope->src[2])) ||
+            (k->rope->src[2] != nullptr && ggml_cuda_ranges_overlap(written[a], k->rope->src[2]))) {
+            return 0;
+        }
+        for (int b = a + 1; b < 3; ++b) {
+            if (ggml_cuda_ranges_overlap(written[a], written[b])) {
+                return 0;
+            }
+        }
+    }
+    ggml_cuda_op_round_rope_qkv(*cuda_ctx, q->rope, &q->src, &q->out, k->rope, &k->src, &k->out, v->x, v->dst);
+    return end - i;
+}
+
 // A ROUND_BF16 at node i folded into its only consumer. Every fused kernel evaluates the
 // same per-element expressions as the unfused nodes, so results are bit-identical:
 //  (a) ROUND(x) -> ADD -> ROUND: the residual add after a projection, one kernel.
@@ -4375,8 +4584,7 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
     static const bool disabled = getenv("GGML_CUDA_NO_ROUND_CONSUMER_FUSION") != nullptr;
     ggml_tensor * round = cgraph->nodes[i];
     const ggml_tensor * x = round->src[0];
-    if (disabled || round->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(round) ||
-        !ggml_cuda_is_elidable(cgraph, i) || (round->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (disabled || !ggml_cuda_round_head_ok(cgraph, i)) {
         return 0;
     }
 
@@ -4425,82 +4633,23 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
         }
     }
 
-    // (b) and (c) read the ROUND through a chain of RESHAPEs, each used once; unrelated
-    // metadata nodes (e.g. position views) may sit in between and are no-ops anyway.
-    // RESHAPE/PERMUTE are views, which ggml_node_has_n_uses() always rejects, so their
-    // own use counts are checked directly (the ROUND they view is checked above).
-    int j = i + 1;
+    // (b), (c), (d) and (e) read the ROUND through a chain of RESHAPEs.
     const ggml_tensor * reshape = nullptr;
-    const ggml_tensor * chain_end = round;
-    for (; j < cgraph->n_nodes && j <= i + 8; ++j) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (n->op == GGML_OP_RESHAPE && n->src[0] == chain_end) {
-            if (ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                return 0;
-            }
-            reshape = chain_end = n;
-            continue;
-        }
-        if (ggml_cuda_is_metadata_op(n) && n->src[0] != chain_end) {
-            continue;
-        }
-        break;
-    }
-    if (reshape == nullptr || j >= cgraph->n_nodes) {
+    const int j = ggml_cuda_round_reshape_consumer(cgraph, i, &reshape);
+    if (j < 0) {
         return 0;
     }
     ggml_tensor * consumer = cgraph->nodes[j];
 
     // (b)
-    if (consumer->op == GGML_OP_ROPE && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F32 &&
-        ((const int32_t *) consumer->op_params)[2] == GGML_ROPE_TYPE_NEOX && ggml_is_contiguous(consumer) &&
-        ggml_cuda_is_elidable(cgraph, j) && !(consumer->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-        ggml_cuda_is_round_bf16_of(cgraph, j + 1, consumer) && x->nb[0] == sizeof(float) &&
-        x->ne[0] == reshape->ne[0] * reshape->ne[1] && x->ne[1] == reshape->ne[2] && x->ne[2] == reshape->ne[3] &&
-        x->ne[3] == 1) {
-        // The rope input [d, h, t, b] is x[d + h*ne0, t, b].
-        ggml_tensor src = *reshape;
-        src.data  = x->data;
-        src.nb[0] = sizeof(float);
-        src.nb[1] = reshape->ne[0] * sizeof(float);
-        src.nb[2] = x->nb[1];
-        src.nb[3] = x->nb[2];
-        ggml_tensor * round_out = cgraph->nodes[j + 1];
-        ggml_tensor out = *round_out;
-        int last = j + 1;
-        if (j + 3 < cgraph->n_nodes && ggml_cuda_is_elidable(cgraph, j + 1) && !(round_out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            const ggml_tensor * perm = cgraph->nodes[j + 2];
-            const ggml_tensor * cont = cgraph->nodes[j + 3];
-            const int32_t * axes = (const int32_t *) perm->op_params;
-            if (perm->op == GGML_OP_PERMUTE && perm->src[0] == round_out && ggml_node_get_use_count(cgraph, j + 2) == 1 &&
-                !(perm->flags & GGML_TENSOR_FLAG_OUTPUT) && axes[0] == 0 && cont->op == GGML_OP_CONT &&
-                cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
-                (cont->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                // Source dim d lands in dim axes[d] of the permute, and so of the CONT.
-                out.data = cont->data;
-                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                    out.nb[d] = cont->nb[axes[d]];
-                }
-                last = j + 3;
-            }
-            // [-> CPY(f16)]: an f16 K/V state; write the rounded values cast to f16. The
-            // CPY's destination view (a row of a K/V cache) may sit just before it.
-            int c = j + 2;
-            if (cgraph->nodes[c]->op == GGML_OP_VIEW && cgraph->nodes[c]->src[0] != round_out) {
-                ++c;
-            }
-            ggml_tensor * cpy = cgraph->nodes[c];
-            if (last == j + 1 && cpy->op == GGML_OP_CPY && cpy->src[0] == round_out && cpy->type == GGML_TYPE_F16 &&
-                ggml_is_contiguous(cpy) && ggml_are_same_shape(cpy, round_out) && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                out = *cpy;
-                last = c;
-            }
+    ggml_cuda_round_chain chain;
+    if (ggml_cuda_round_rope_chain(cgraph, i, j, reshape, chain)) {
+        const int skip = ggml_cuda_try_fuse_round_qkv(cuda_ctx, cgraph, i, chain);
+        if (skip > 0) {
+            return skip;
         }
-        const ggml_tensor * written = cgraph->nodes[last];
-        if (!ggml_cuda_ranges_overlap(written, x)) {
-            ggml_cuda_op_round_rope_round_bf16(*cuda_ctx, consumer, &src, &out);
-            return last - i;
-        }
+        ggml_cuda_op_round_rope_round_bf16(*cuda_ctx, chain.rope, &chain.src, &chain.out);
+        return chain.last - i;
     }
 
     // (e) ROUND(x) -> RESHAPE -> MUL_MAT on mul_mat_vec_q with q8_0 weights: write the rounded
@@ -4514,11 +4663,13 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
     }
 
     // (d) ROUND(x) -> RESHAPE -> CPY(f16): the f16 V state, one kernel.
-    if (consumer->op == GGML_OP_CPY && consumer->src[0] == reshape && consumer->type == GGML_TYPE_F16 &&
-        ggml_is_contiguous(consumer) && ggml_nelements(consumer) == ggml_nelements(x) && x->nb[0] == sizeof(float) &&
-        !ggml_cuda_ranges_overlap(consumer, x)) {
-        ggml_cuda_op_round_bf16_to_f16(*cuda_ctx, x, consumer);
-        return j - i;
+    if (ggml_cuda_round_f16_chain(cgraph, i, j, reshape, chain)) {
+        const int skip = ggml_cuda_try_fuse_round_qkv(cuda_ctx, cgraph, i, chain);
+        if (skip > 0) {
+            return skip;
+        }
+        ggml_cuda_op_round_bf16_to_f16(*cuda_ctx, chain.x, chain.dst);
+        return chain.last - i;
     }
 
     // (c)

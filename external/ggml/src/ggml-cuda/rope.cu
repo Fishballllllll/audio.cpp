@@ -125,8 +125,10 @@ static __global__ void rope_norm(const T *            x,
 
 // round_in: the input is rounded to bf16 as it is read (ROUND_BF16 -> ROPE fusion);
 // the arithmetic on the rounded values is unchanged.
+// One NEOX rope work item (row row_dst, dims i0 and i0 + n_dims/2); shared by rope_neox and
+// rope_neox_qkv so both evaluate the same expressions.
 template <bool forward, bool has_ff, typename T, typename D, bool round_bf16 = false, bool round_in = false>
-static __global__ void rope_neox(const T *            x,
+static __device__ __forceinline__ void rope_neox_row(const T *            x,
                                  D *                  dst,
                                  const int            ne00,
                                  const int            ne01,
@@ -146,15 +148,9 @@ static __global__ void rope_neox(const T *            x,
                                  const float          theta_scale,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
-                                 const int            set_rows_stride) {
-    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
-
-    if (i0 >= ne00) {
-        return;
-    }
-
-    const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
-
+                                 const int            set_rows_stride,
+                                                     const int            row_dst,
+                                                     const int            i0) {
     const uint32_t i3 = row_dst / (ne01 * ne02);
     const uint32_t i2 = (row_dst - i3 * ne01 * ne02) / ne01;
     const uint32_t i1 = row_dst - i3 * ne01 * ne02 - i2 * ne01;
@@ -195,6 +191,42 @@ static __global__ void rope_neox(const T *            x,
 
     dst[idst + 0]          = ggml_cuda_cast<D>(rope_round<round_bf16>(x0 * cos_theta - x1 * sin_theta));
     dst[idst + n_dims / 2] = ggml_cuda_cast<D>(rope_round<round_bf16>(x0 * sin_theta + x1 * cos_theta));
+}
+
+template <bool forward, bool has_ff, typename T, typename D, bool round_bf16 = false, bool round_in = false>
+static __global__ void rope_neox(const T *            x,
+                                 D *                  dst,
+                                 const int            ne00,
+                                 const int            ne01,
+                                 const int            ne02,
+                                 const int            s01,
+                                 const int            s02,
+                                 const int            s03,
+                                 const int            s1,
+                                 const int            s2,
+                                 const int            s3,
+                                 const int            n_dims,
+                                 const int32_t *      pos,
+                                 const float          freq_scale,
+                                 const float          ext_factor,
+                                 const float          attn_factor,
+                                 const rope_corr_dims corr_dims,
+                                 const float          theta_scale,
+                                 const float *        freq_factors,
+                                 const int64_t *      row_indices,
+                                 const int            set_rows_stride) {
+    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+
+    if (i0 >= ne00) {
+        return;
+    }
+
+    const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
+
+    rope_neox_row<forward, has_ff, T, D, round_bf16, round_in>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims,
+                                                                pos, freq_scale, ext_factor, attn_factor, corr_dims,
+                                                                theta_scale, freq_factors, row_indices, set_rows_stride,
+                                                                row_dst, i0);
 }
 
 template <bool forward, bool has_ff, typename T>
@@ -749,4 +781,118 @@ void ggml_cuda_op_round_rope_round_bf16(ggml_backend_cuda_context & ctx, ggml_te
     const int mode = ((const int32_t *) rope->op_params)[2];
     GGML_ASSERT(mode == GGML_ROPE_TYPE_NEOX);
     ggml_cuda_op_rope_impl<true>(ctx, rope, nullptr, out, src_unrounded, true);
+}
+
+// Arguments of one rope_neox launch, derived as in ggml_cuda_op_rope_impl.
+struct rope_neox_launch {
+    const float *  x;
+    void *         dst;
+    int            ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, nr;
+    const int32_t * pos;
+    float          freq_scale, ext_factor, attn_factor, theta_scale;
+    rope_corr_dims corr_dims;
+    const float *  freq_factors;
+};
+
+static rope_neox_launch rope_neox_launch_for(const ggml_tensor * rope, const ggml_tensor * src0, const ggml_tensor * out) {
+    rope_neox_launch l;
+    l.x    = (const float *) src0->data;
+    l.dst  = out->data;
+    l.ne00 = src0->ne[0];
+    l.ne01 = src0->ne[1];
+    l.ne02 = src0->ne[2];
+    l.nr   = ggml_nrows(src0);
+    l.s01  = src0->nb[1] / ggml_type_size(src0->type);
+    l.s02  = src0->nb[2] / ggml_type_size(src0->type);
+    l.s03  = src0->nb[3] / ggml_type_size(src0->type);
+    l.s1   = out->nb[1] / ggml_type_size(out->type);
+    l.s2   = out->nb[2] / ggml_type_size(out->type);
+    l.s3   = out->nb[3] / ggml_type_size(out->type);
+    l.n_dims = ((const int32_t *) rope->op_params)[1];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,     (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&l.freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&l.ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&l.attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,     (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,     (const int32_t *) rope->op_params + 10, sizeof(float));
+    ggml_rope_yarn_corr_dims(l.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, l.corr_dims.v);
+    l.theta_scale  = powf(freq_base, -2.0f / l.n_dims);
+    l.pos          = (const int32_t *) rope->src[1]->data;
+    l.freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
+    return l;
+}
+
+// Blocks [0, q.nr) rope q rows, [q.nr, q.nr + k.nr) rope k rows (to f16), the rest round v to f16.
+template <bool has_ff>
+static __global__ void rope_neox_qkv(const rope_neox_launch q, const rope_neox_launch k,
+                                     const char * v_x, half * v_dst, const int64_t v_k,
+                                     const int64_t v_ne0, const int64_t v_ne1, const int64_t v_ne2,
+                                     const int64_t v_nb01, const int64_t v_nb02, const int64_t v_nb03) {
+    const int i0 = 2*threadIdx.y;
+    if (blockIdx.x < q.nr) {
+        if (i0 < q.ne00) {
+            rope_neox_row<true, has_ff, float, float, true, true>(
+                q.x, (float *) q.dst, q.ne00, q.ne01, q.ne02, q.s01, q.s02, q.s03, q.s1, q.s2, q.s3, q.n_dims, q.pos,
+                q.freq_scale, q.ext_factor, q.attn_factor, q.corr_dims, q.theta_scale, q.freq_factors, nullptr, 0,
+                blockIdx.x, i0);
+        }
+        return;
+    }
+    if (blockIdx.x < q.nr + k.nr) {
+        if (i0 < k.ne00) {
+            rope_neox_row<true, has_ff, float, half, true, true>(
+                k.x, (half *) k.dst, k.ne00, k.ne01, k.ne02, k.s01, k.s02, k.s03, k.s1, k.s2, k.s3, k.n_dims, k.pos,
+                k.freq_scale, k.ext_factor, k.attn_factor, k.corr_dims, k.theta_scale, k.freq_factors, nullptr, 0,
+                blockIdx.x - q.nr, i0);
+        }
+        return;
+    }
+    const int64_t i = (int64_t) (blockIdx.x - q.nr - k.nr)*blockDim.y + threadIdx.y;
+    if (i >= v_k) {
+        return;
+    }
+    const int64_t j0 = i % v_ne0;
+    const int64_t j1 = (i / v_ne0) % v_ne1;
+    const int64_t j2 = (i / (v_ne0*v_ne1)) % v_ne2;
+    const int64_t j3 = i / (v_ne0*v_ne1*v_ne2);
+    const float * x = (const float *) (v_x + j1*v_nb01 + j2*v_nb02 + j3*v_nb03);
+    v_dst[i] = __float2half(rope_round<true>(x[j0]));
+}
+
+void ggml_cuda_op_round_rope_qkv(ggml_backend_cuda_context & ctx,
+                                 const ggml_tensor * q_rope, const ggml_tensor * q_src, const ggml_tensor * q_out,
+                                 const ggml_tensor * k_rope, const ggml_tensor * k_src, const ggml_tensor * k_out,
+                                 const ggml_tensor * v_x, const ggml_tensor * v_dst) {
+    for (const ggml_tensor * rope : { q_rope, k_rope }) {
+        GGML_ASSERT(((const int32_t *) rope->op_params)[2] == GGML_ROPE_TYPE_NEOX);
+    }
+    GGML_ASSERT(q_src->type == GGML_TYPE_F32 && k_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(q_src, q_rope->src[0]) && ggml_are_same_shape(k_src, k_rope->src[0]));
+    GGML_ASSERT(q_out->type == GGML_TYPE_F32 && k_out->type == GGML_TYPE_F16);
+    GGML_ASSERT(q_src->ne[0] % 2 == 0 && q_src->ne[0] <= 2*CUDA_ROPE_BLOCK_SIZE);
+    GGML_ASSERT(k_src->ne[0] % 2 == 0 && k_src->ne[0] <= 2*CUDA_ROPE_BLOCK_SIZE);
+    GGML_ASSERT((q_rope->src[2] == nullptr) == (k_rope->src[2] == nullptr));
+    GGML_ASSERT(v_x->type == GGML_TYPE_F32 && v_x->nb[0] == sizeof(float));
+    GGML_ASSERT(v_dst->type == GGML_TYPE_F16 && ggml_is_contiguous(v_dst) && ggml_nelements(v_dst) == ggml_nelements(v_x));
+
+    const rope_neox_launch q = rope_neox_launch_for(q_rope, q_src, q_out);
+    const rope_neox_launch k = rope_neox_launch_for(k_rope, k_src, k_out);
+    const int64_t v_k      = ggml_nelements(v_dst);
+    const int64_t v_blocks = (v_k + CUDA_ROPE_BLOCK_SIZE - 1) / CUDA_ROPE_BLOCK_SIZE;
+    GGML_ASSERT(q.nr + k.nr + v_blocks < INT_MAX);
+    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
+    const dim3 block_nums((unsigned int) (q.nr + k.nr + v_blocks), 1, 1);
+    if (q.freq_factors != nullptr) {
+        rope_neox_qkv<true><<<block_nums, block_dims, 0, ctx.stream()>>>(
+            q, k, (const char *) v_x->data, (half *) v_dst->data, v_k, v_x->ne[0], v_x->ne[1], v_x->ne[2],
+            v_x->nb[1], v_x->nb[2], v_x->nb[3]);
+    } else {
+        rope_neox_qkv<false><<<block_nums, block_dims, 0, ctx.stream()>>>(
+            q, k, (const char *) v_x->data, (half *) v_dst->data, v_k, v_x->ne[0], v_x->ne[1], v_x->ne[2],
+            v_x->nb[1], v_x->nb[2], v_x->nb[3]);
+    }
 }
