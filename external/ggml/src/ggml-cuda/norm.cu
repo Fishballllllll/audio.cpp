@@ -111,8 +111,9 @@ static __device__ __forceinline__ float rms_norm_round_bf16(float x) {
 // (operands in the ADD's order) and stored before it is normalized, exactly as the
 // separate ROUND -> ADD -> ROUND kernel would have stored it.
 // do_q8: also write the rounded output as q8_1 rows for mul_mat_vec_q (needs ncols % QK8_1 == 0).
+// do_round_in: x is rounded to bf16 as it is read (a ROUND_BF16 feeding the norm).
 template <int block_size, bool do_multiply = false, bool do_add = false, bool do_round_bf16 = false, bool do_residual = false,
-          bool do_q8 = false>
+          bool do_q8 = false, bool do_round_in = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -152,6 +153,7 @@ static __global__ void rms_norm_f32(const float * x,
     static_assert(!do_round_bf16 || (do_multiply && !do_add), "bf16 rounding is only fused after the multiply");
     static_assert(!do_residual || do_round_bf16, "the residual is only fused with the bf16-rounded norm");
     static_assert(!do_q8 || do_round_bf16, "q8_1 rows are only written for the bf16-rounded norm");
+    static_assert(!do_round_in || (do_round_bf16 && !do_residual), "input rounding is only fused with the bf16-rounded norm");
 
     if constexpr (do_residual) {
         res_x     += sample*stride_sample + channel*stride_channel + row*stride_row;
@@ -182,6 +184,8 @@ static __global__ void rms_norm_f32(const float * x,
             const float r = rms_norm_round_bf16(res_x[col]);
             xi = rms_norm_round_bf16(res_x_first ? r + res_other[col] : res_other[col] + r);
             const_cast<float *>(x)[col] = xi;
+        } else if constexpr (do_round_in) {
+            xi = rms_norm_round_bf16(x[col]);
         } else {
             xi = x[col];
         }
@@ -202,7 +206,8 @@ static __global__ void rms_norm_f32(const float * x,
             dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
         } else if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
-            const float value = scale * x[col] * mul[mul_col];
+            const float xv    = do_round_in ? rms_norm_round_bf16(x[col]) : x[col];
+            const float value = scale * xv * mul[mul_col];
             if constexpr (do_round_bf16) {
                 const float rounded = rms_norm_round_bf16(value);
                 dst[col] = rounded;
@@ -557,7 +562,8 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float    eps,
                                   cudaStream_t   stream,
                                   const bool     round_bf16 = false,
-                                  void *         q8         = nullptr) {
+                                  void *         q8         = nullptr,
+                                  const bool     round_in   = false) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         GGML_ASSERT(!round_bf16);
@@ -583,6 +589,21 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                 launch_q8(std::integral_constant<int, 256>{});
             } else {
                 launch_q8(std::integral_constant<int, 1024>{});
+            }
+            return;
+        }
+        if (round_in) {
+            GGML_ASSERT(round_bf16);
+            const auto launch_round_in = [&](auto block_tag) {
+                constexpr int bs = decltype(block_tag)::value;
+                rms_norm_f32<bs, true, false, true, false, false, true><<<blocks_num, dim3(bs, 1, 1), bs > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                    mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            };
+            if (ncols < 1024) {
+                launch_round_in(std::integral_constant<int, 256>{});
+            } else {
+                launch_round_in(std::integral_constant<int, 1024>{});
             }
             return;
         }
@@ -888,8 +909,10 @@ void ggml_cuda_op_rms_norm_channels_add_bias_silu(ggml_backend_cuda_context & ct
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
-                                 ggml_tensor * round_bf16_tensor, void * q8) {
-    const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+                                 ggml_tensor * round_bf16_tensor, void * q8, const ggml_tensor * src_unrounded) {
+    GGML_ASSERT(src_unrounded == nullptr ||
+                (ggml_are_same_shape(src_unrounded, dst->src[0]) && round_bf16_tensor != nullptr && q8 == nullptr));
+    const ggml_tensor * rms_norm_src = src_unrounded != nullptr ? src_unrounded : (const ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -948,7 +971,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
-                          eps, stream, round_bf16_tensor != nullptr, q8);
+                          eps, stream, round_bf16_tensor != nullptr, q8, src_unrounded != nullptr);
 }
 
 void ggml_cuda_op_round_add_round_rms_norm_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * res_x,

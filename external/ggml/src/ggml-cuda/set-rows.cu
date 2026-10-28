@@ -109,7 +109,8 @@ static void set_rows_cuda_quant(
     }
 }
 
-template <typename src_t, typename idx_t, typename dst_t>
+// round_in: each value is rounded to bf16 as it is read (a ROUND_BF16 feeding the rows).
+template <typename src_t, typename idx_t, typename dst_t, bool round_in = false>
 static __global__ void k_set_rows(const src_t * __restrict__ src0,
                                   const idx_t * __restrict__ src1,
                                   dst_t * __restrict__ dst,
@@ -162,7 +163,11 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     dst_t * dst_row_ptr    = dst + dst_row*s1 + i02*s2 + i03*s3;
 
-    dst_row_ptr[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    if constexpr (round_in) {
+        dst_row_ptr[i00] = ggml_cuda_cast<dst_t>(__bfloat162float(__float2bfloat16(src0_row[i00])));
+    } else {
+        dst_row_ptr[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    }
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -178,7 +183,7 @@ static void set_rows_cuda(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const bool round_in = false) {
 
     const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
@@ -203,6 +208,15 @@ static void set_rows_cuda(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
+        if constexpr (std::is_same_v<src_t, float>) {
+            if (round_in) {
+                k_set_rows<src_t, idx_t, dst_t, true><<<grid_size, block_size, 0, stream>>>(
+                    src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                return;
+            }
+        }
+        GGML_ASSERT(!round_in);
         k_set_rows<<<grid_size, block_size, 0, stream>>>(src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01,
                                                          s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
                                                          ne11_fd, ne12_fd);
@@ -210,13 +224,15 @@ static void set_rows_cuda(
 }
 
 template<typename src_t, typename idx_t>
-static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                          const bool round_in = false) {
     const src_t * src0_d = (const src_t *)src0->data;
     const idx_t * src1_d = (const idx_t *)src1->data;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     cudaStream_t stream = ctx.stream();
+    GGML_ASSERT(!round_in || dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
 
 
     if (dst->type == GGML_TYPE_F32) {
@@ -227,7 +243,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, round_in
         );
     } else if (dst->type == GGML_TYPE_F16) {
         set_rows_cuda(
@@ -237,7 +253,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, round_in
         );
     } else if (dst->type == GGML_TYPE_BF16) {
         set_rows_cuda(
@@ -247,7 +263,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, round_in
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
@@ -326,5 +342,18 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);
     } else {
         set_rows_cuda<float, int32_t>(ctx, src0, src1, dst);
+    }
+}
+
+void ggml_cuda_op_round_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * src_unrounded) {
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src_unrounded->type == GGML_TYPE_F32 && src_unrounded->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(src_unrounded, dst->src[0]));
+    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (src1->type == GGML_TYPE_I64) {
+        set_rows_cuda<float, int64_t>(ctx, src_unrounded, src1, dst, true);
+    } else {
+        set_rows_cuda<float, int32_t>(ctx, src_unrounded, src1, dst, true);
     }
 }

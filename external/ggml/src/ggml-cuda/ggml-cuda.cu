@@ -83,6 +83,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <set> // TMPDIAG
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -4672,6 +4673,57 @@ static int ggml_cuda_try_fuse_round_consumer(ggml_backend_cuda_context * cuda_ct
         return chain.last - i;
     }
 
+    // (f) ROUND(x) -> RESHAPE -> RMS_NORM -> MUL -> ROUND: a per-head q/k norm of heads sliced
+    //     from a packed QKV projection; the norm kernel rounds x as it reads it.
+    static const bool no_read_round = getenv("GGML_CUDA_NO_ROUND_READ_FUSION") != nullptr;
+    if (!no_read_round && consumer->op == GGML_OP_RMS_NORM && consumer->src[0] == reshape && x->nb[0] == sizeof(float) &&
+        x->ne[0] == reshape->ne[0] * reshape->ne[1] && x->ne[1] == reshape->ne[2] && x->ne[2] == reshape->ne[3] &&
+        x->ne[3] == 1 && ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+        ggml_cuda_is_elidable(cgraph, j + 1) && ggml_cuda_is_round_bf16_of(cgraph, j + 2, cgraph->nodes[j + 1]) &&
+        ggml_cuda_prequant_q8_1_consumer(cgraph, j + 2) == nullptr) {
+        const int outputs[] = { j + 2 };
+        ggml_tensor * out = cgraph->nodes[j + 2];
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, j, 3, outputs, 1) && !ggml_cuda_ranges_overlap(out, x)) {
+            // The norm input [d, h, t, b] is x[d + h*ne0, t, b].
+            ggml_tensor src = *reshape;
+            src.data  = x->data;
+            src.nb[0] = sizeof(float);
+            src.nb[1] = reshape->ne[0] * sizeof(float);
+            src.nb[2] = x->nb[1];
+            src.nb[3] = x->nb[2];
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, consumer, cgraph->nodes[j + 1], out, nullptr, &src);
+            return j + 2 - i;
+        }
+    }
+
+    // (g) ROUND(x) -> RESHAPE -> VIEW -> SET_ROWS: a V row sliced from a packed QKV projection,
+    //     written into a K/V cache; one row per batch entry of a single token.
+    if (!no_read_round && consumer->op == GGML_OP_VIEW && consumer->src[0] == reshape && consumer->data == round->data &&
+        ggml_node_get_use_count(cgraph, j) == 1 && !(consumer->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        x->nb[0] == sizeof(float) && x->ne[1] == 1 && x->ne[3] == 1 && consumer->ne[0] == x->ne[0] &&
+        consumer->ne[1] == x->ne[2] && consumer->ne[2] == 1 && consumer->ne[3] == 1 &&
+        consumer->nb[1] == x->ne[0] * sizeof(float)) {
+        int k = j + 1;
+        while (k < cgraph->n_nodes && k <= j + 4 && ggml_cuda_is_metadata_op(cgraph->nodes[k]) &&
+               cgraph->nodes[k]->src[0] != consumer) {
+            ++k;
+        }
+        ggml_tensor * set_rows = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (set_rows != nullptr && set_rows->op == GGML_OP_SET_ROWS && set_rows->src[0] == consumer &&
+            (set_rows->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            (set_rows->type == GGML_TYPE_F32 || set_rows->type == GGML_TYPE_F16 || set_rows->type == GGML_TYPE_BF16) &&
+            !ggml_cuda_ranges_overlap(set_rows, x)) {
+            // Row b of the view is x[:, 0, b].
+            ggml_tensor src = *consumer;
+            src.data  = x->data;
+            src.nb[1] = x->nb[2];
+            src.nb[2] = x->nb[2] * consumer->ne[1];
+            src.nb[3] = src.nb[2];
+            ggml_cuda_op_round_set_rows(*cuda_ctx, set_rows, &src);
+            return k - i;
+        }
+    }
+
     // (c)
     if (consumer->op == GGML_OP_MUL_MAT && consumer->src[1] == reshape && consumer->src[0]->type == GGML_TYPE_BF16 &&
         consumer->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == ggml_nelements(round) &&
@@ -5430,6 +5482,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool graph_evaluated_or_captured = false;
     // No q8_1 rows carry over from another graph.
     ggml_cuda_prequant_q8_1_slot() = {};
+    { // TMPDIAG begin: TMPNODES=lo,hi dumps every node of each graph size in [lo, hi] once
+        static const char * spec = getenv("TMPNODES");
+        static std::set<int> dumped;
+        int lo = 0, hi = 0;
+        if (spec != nullptr && sscanf(spec, "%d,%d", &lo, &hi) == 2 && cgraph->n_nodes >= lo && cgraph->n_nodes <= hi &&
+            dumped.insert(cgraph->n_nodes).second) {
+            auto desc = [](const ggml_tensor * t) {
+                char buf[200];
+                if (t == nullptr) return std::string("-");
+                snprintf(buf, sizeof(buf), "%s:%s[%lld,%lld,%lld,%lld]%s", ggml_op_desc(t), ggml_type_name(t->type),
+                         (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                         ggml_is_contiguous(t) ? "" : "nc");
+                return std::string(buf);
+            };
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                int s0 = -1, s1 = -1;
+                for (int j = i - 1; j >= 0 && j >= i - 64 && (s0 < 0 || s1 < 0); --j) {
+                    if (cgraph->nodes[j] == n->src[0]) s0 = j;
+                    if (cgraph->nodes[j] == n->src[1]) s1 = j;
+                }
+                fprintf(stderr, "NODES %d %5d %s%s | s0=%d %s | s1=%d %s\n", cgraph->n_nodes, i, desc(n).c_str(),
+                        (n->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : " (nocompute)", s0, desc(n->src[0]).c_str(), s1,
+                        desc(n->src[1]).c_str());
+            }
+        }
+    } // TMPDIAG end
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;

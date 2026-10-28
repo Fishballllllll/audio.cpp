@@ -20,8 +20,11 @@ void ggml_cuda_op_round_add_round_rms_norm_fused(ggml_backend_cuda_context & ctx
                                                  ggml_tensor * rms, ggml_tensor * mul_tensor, ggml_tensor * round_tensor,
                                                  void * q8 = nullptr);
 
+// src_unrounded: read the norm input from here (dst->src[0]'s shape, own strides), rounding
+// each value to bf16 as it is read (ROUND_BF16 -> [RESHAPE] -> RMS_NORM -> MUL -> ROUND_BF16).
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
-                                 ggml_tensor * round_bf16_tensor = nullptr, void * q8 = nullptr);
+                                 ggml_tensor * round_bf16_tensor = nullptr, void * q8 = nullptr,
+                                 const ggml_tensor * src_unrounded = nullptr);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
