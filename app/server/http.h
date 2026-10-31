@@ -99,6 +99,9 @@ using ShutdownRequested = bool (*)();
 
 HttpResponse json_response(std::string body, int status = 200);
 HttpResponse error_response(int status, const std::string & message, const std::string & type);
+// Binds the port now, before the models load; serve_http() then uses that socket.
+// Clients wait in the listen backlog until the server is ready.
+void prebind_http_listener(const std::string & host, int port);
 void serve_http(const std::string & host, int port, IHttpHandler & handler, ShutdownRequested shutdown_requested, uint64_t max_request_body_bytes);
 
 }  // namespace minitts::server

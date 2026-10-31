@@ -872,9 +872,22 @@ HttpResponse error_response(int status, const std::string & message, const std::
     return json_response(body, status);
 }
 
+namespace {
+struct PreboundListener {
+    SocketRuntime sockets;
+    UniqueSocket socket;
+};
+std::unique_ptr<PreboundListener> prebound_listener;
+}  // namespace
+
+void prebind_http_listener(const std::string & host, int port) {
+    prebound_listener = std::make_unique<PreboundListener>();
+    prebound_listener->socket = bind_listen_socket(host, port);
+}
+
 void serve_http(const std::string & host, int port, IHttpHandler & handler, ShutdownRequested shutdown_requested, uint64_t max_request_body_bytes) {
     SocketRuntime sockets;
-    auto listen_socket = bind_listen_socket(host, port);
+    auto listen_socket = prebound_listener != nullptr ? std::move(prebound_listener->socket) : bind_listen_socket(host, port);
     std::cout << "audiocpp_server listening on http://" << host << ":" << port << "\n";
     while (!shutdown_requested()) {
         if (!wait_for_client(listen_socket.get(), 250)) {

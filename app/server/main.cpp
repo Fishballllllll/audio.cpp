@@ -324,6 +324,9 @@ int main(int argc, char ** argv) {
         }
 
         const auto ui_resource_anchor = executable_directory(argc > 0 ? argv[0] : nullptr);
+        if (std::getenv("AUDIOCPP_EARLY_LISTEN") != nullptr && !parallel_jobs && config.frontend_listener.empty()) {
+            minitts::server::prebind_http_listener(config.host, config.port);
+        }
         auto serve = [&](auto & state) {
             if (!config.frontend_listener.empty()) {
                 auto listener = state.make_frontend_listener(config.frontend_listener);
