@@ -1,3 +1,6 @@
+#include <ggml-backend.h>
+#include <cstdlib>
+#include <thread>
 #include "config.h"
 #include "http.h"
 #include "runtime.h"
@@ -164,7 +167,28 @@ void print_help() {
 
 }  // namespace
 
+// Creating the first GPU context takes about a second while the GPU is idle. With
+// AUDIOCPP_PREWARM_GPU=1 that happens next to the model inspection, not after it.
+static void prewarm_gpu_in_background() {
+    if (std::getenv("AUDIOCPP_PREWARM_GPU") == nullptr) {
+        return;
+    }
+    std::thread([] {
+        ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_t backend = device != nullptr ? ggml_backend_dev_init(device, nullptr) : nullptr;
+        if (backend == nullptr) {
+            return;
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_buffer(backend, 4096);
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+        ggml_backend_free(backend);
+    }).detach();
+}
+
 int main(int argc, char ** argv) {
+    prewarm_gpu_in_background();
     try {
         if (has_arg(argc, argv, "--list-devices")) {
             engine::core::print_backend_devices(std::cout);
