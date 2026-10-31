@@ -8,6 +8,7 @@
 #include "engine/models/breeze_tts/text_encoder.h"
 #include "engine/models/breeze_tts/tokenizer_text.h"
 
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -71,7 +72,8 @@ public:
         engine::assets::TensorStorageType storage_type,
         engine::core::AttentionPreference attention_preference = engine::core::AttentionPreference::Auto,
         Bf16ActivationMode bf16_activations = Bf16ActivationMode::Auto,
-        BreezePerfOptions perf = {});
+        BreezePerfOptions perf = {},
+        const std::filesystem::path & cache_dir = {});
     ~BreezeGeneratorRuntime();
 
     engine::runtime::AudioBuffer generate(

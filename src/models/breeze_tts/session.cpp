@@ -13,6 +13,8 @@
 #include <cstdio> // TMPDIAG
 #include <cstdlib> // TMPDIAG
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -143,7 +145,8 @@ void validate_session_options(
                              "breeze_tts.perf_mode", "breeze_tts.fused_depth",
                              "breeze_tts.direct_prefill", "breeze_tts.skip_cache_round",
                              "breeze_tts.round_bf16_fusion", "breeze_tts.batched_cfg",
-                             "breeze_tts.pipelined_frames", "breeze_tts.exec_plan"}) {
+                             "breeze_tts.pipelined_frames", "breeze_tts.exec_plan",
+                             "breeze_tts.disk_cache_dir"}) {
         if (contract.session_option_keys.find(key) == contract.session_option_keys.end()) {
             validation_options.options.erase(key);
         }
@@ -196,6 +199,75 @@ uint64_t fnv1a_mix(uint64_t hash, const void * data, size_t size) {
         hash *= 1099511628211ull;
     }
     return hash;
+}
+
+// Results derived from the weights (embedding rows, reference codes) are kept
+// under breeze_tts.disk_cache_dir, in a folder named after the weights file and
+// the storage type, so a different model never reads them.
+std::filesystem::path disk_cache_dir_from_options(
+    const runtime::SessionOptions & options,
+    const BreezeTTSAssets & assets) {
+    const auto value = runtime::find_option(options.options, {"breeze_tts.disk_cache_dir"});
+    if (!value.has_value() || value->empty()) {
+        return {};
+    }
+    const auto & source = assets.weights->source_path();
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(source, error);
+    const int64_t stamp = std::filesystem::last_write_time(source, error).time_since_epoch().count();
+    const std::string path = source.string();
+    const std::string weight_type = runtime::find_option(options.options, {"breeze_tts.weight_type", "weight_type"}).value_or("");
+    uint64_t hash = 1469598103934665603ull;
+    hash = fnv1a_mix(hash, path.data(), path.size());
+    hash = fnv1a_mix(hash, &size, sizeof(size));
+    hash = fnv1a_mix(hash, &stamp, sizeof(stamp));
+    hash = fnv1a_mix(hash, weight_type.data(), weight_type.size());
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
+    auto dir = std::filesystem::path(*value) / name;
+    std::filesystem::create_directories(dir, error);
+    return error ? std::filesystem::path{} : dir;
+}
+
+constexpr uint64_t kReferenceCacheMagic = 0x3153454452464552ull;
+
+bool read_reference_codes(const std::filesystem::path & path, BreezeSpeechCodes & codes) {
+    std::ifstream in(path, std::ios::binary);
+    uint64_t header[4] = {0, 0, 0, 0};
+    if (!in.read(reinterpret_cast<char *>(header), sizeof(header)) || header[0] != kReferenceCacheMagic ||
+        header[3] != header[1] * header[2] || header[3] == 0) {
+        return false;
+    }
+    BreezeSpeechCodes out;
+    out.frames = static_cast<int64_t>(header[1]);
+    out.code_groups = static_cast<int64_t>(header[2]);
+    out.codes.resize(static_cast<size_t>(header[3]));
+    if (!in.read(reinterpret_cast<char *>(out.codes.data()), static_cast<std::streamsize>(header[3] * sizeof(int32_t)))) {
+        return false;
+    }
+    codes = std::move(out);
+    return true;
+}
+
+// Best effort: a failed write only means the reference is encoded again next time.
+void write_reference_codes(const std::filesystem::path & path, const BreezeSpeechCodes & codes) {
+    auto temporary = path;
+    temporary += ".tmp";
+    std::error_code error;
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        const uint64_t header[4] = {kReferenceCacheMagic, static_cast<uint64_t>(codes.frames),
+                                    static_cast<uint64_t>(codes.code_groups), codes.codes.size()};
+        out.write(reinterpret_cast<const char *>(header), sizeof(header));
+        out.write(reinterpret_cast<const char *>(codes.codes.data()),
+                  static_cast<std::streamsize>(codes.codes.size() * sizeof(int32_t)));
+        if (!out) {
+            out.close();
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
 }
 
 uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
@@ -259,6 +331,7 @@ BreezeTTSSession::BreezeTTSSession(
     const auto bf16_activations = bf16_activation_mode_from_options(options);
     const auto perf = perf_options_from_options(options, execution_context().backend_type());
     core::set_backend_round_bf16_fusion(execution_context().backend(), round_bf16_fusion_from_options(options));
+    disk_cache_dir_ = disk_cache_dir_from_options(options, *assets_);
     generator_ = std::make_unique<BreezeGeneratorRuntime>(
         assets_,
         execution_context(),
@@ -267,7 +340,8 @@ BreezeTTSSession::BreezeTTSSession(
         storage_type,
         attention_preference,
         bf16_activations,
-        perf);
+        perf,
+        disk_cache_dir_);
 }
 
 BreezeTTSSession::~BreezeTTSSession() = default;
@@ -303,7 +377,20 @@ BreezeSpeechCodes BreezeTTSSession::resolve_reference_codes(const runtime::Audio
     }
     const auto start = std::chrono::steady_clock::now();
     ReferenceCacheEntry entry;
-    entry.codes = generator_->encode_reference(audio);
+    std::filesystem::path disk_path;
+    if (!disk_cache_dir_.empty()) {
+        char name[96];
+        std::snprintf(name, sizeof(name), "ref_%016llx_%llx_%d_%d.bin", static_cast<unsigned long long>(key.sample_hash),
+                      static_cast<unsigned long long>(key.sample_count), static_cast<int>(key.sample_rate),
+                      static_cast<int>(key.channels));
+        disk_path = disk_cache_dir_ / name;
+    }
+    if (disk_path.empty() || !read_reference_codes(disk_path, entry.codes)) {
+        entry.codes = generator_->encode_reference(audio);
+        if (!disk_path.empty()) {
+            write_reference_codes(disk_path, entry.codes);
+        }
+    }
     engine::debug::trace_log_scalar("breeze_tts.reference.frames", entry.codes.frames);
     engine::debug::trace_log_scalar("breeze_tts.reference.codebooks", entry.codes.code_groups);
     if (reference_cache_.capacity() == 0) {

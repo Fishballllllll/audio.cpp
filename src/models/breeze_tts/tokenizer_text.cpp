@@ -2,6 +2,8 @@
 
 #include "engine/framework/tokenizers/llama_bpe.h"
 
+#include <future>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -54,8 +56,10 @@ void append_audio_placeholders(BreezePromptBranch & out, int32_t audio_token, in
 
 }  // namespace
 
-struct BreezeTextTokenizer::Impl {
-    Impl(std::shared_ptr<const BreezeTTSAssets> assets)
+namespace {
+
+struct LoadedTokenizer {
+    LoadedTokenizer(std::shared_ptr<const BreezeTTSAssets> assets)
         : assets(std::move(assets)),
           tokenizer(engine::tokenizers::LlamaBpeTokenizerSpec{
               {},
@@ -79,8 +83,28 @@ struct BreezeTextTokenizer::Impl {
     int32_t audio_eos = 0;
 };
 
+}  // namespace
+
+// Parsing tokenizer.json takes about two seconds and nothing needs it until the
+// first prompt, so it runs next to the weight upload instead of before it.
+struct BreezeTextTokenizer::Impl {
+    explicit Impl(std::shared_ptr<const BreezeTTSAssets> assets)
+        : pending(std::async(std::launch::async, [assets = std::move(assets)] {
+              return std::make_unique<LoadedTokenizer>(assets);
+          })) {}
+
+    const LoadedTokenizer & get() {
+        std::call_once(once, [this] { loaded = pending.get(); });
+        return *loaded;
+    }
+
+    std::future<std::unique_ptr<LoadedTokenizer>> pending;
+    std::once_flag once;
+    std::unique_ptr<LoadedTokenizer> loaded;
+};
+
 BreezeTextTokenizer::BreezeTextTokenizer(std::shared_ptr<const BreezeTTSAssets> assets)
-    : impl_(std::make_unique<Impl>(std::move(assets))) {}
+    : assets_(assets), impl_(std::make_unique<Impl>(std::move(assets))) {}
 
 BreezeTextTokenizer::~BreezeTextTokenizer() = default;
 
@@ -89,14 +113,14 @@ BreezePromptBranch BreezeTextTokenizer::build_tts_instruction(
     const std::string & instruction) const {
     const std::string actual_instruction = instruction.empty() ? kDefaultInstruction : instruction;
     BreezePromptBranch out;
-    append_tokens(out, impl_->encode_text_segment(
+    append_tokens(out, impl_->get().encode_text_segment(
         std::string(kSpeaker0) + kInstructionBos + actual_instruction + kInstructionEos + text), true);
     return out;
 }
 
 BreezePromptBranch BreezeTextTokenizer::build_tts_plain(const std::string & text) const {
     BreezePromptBranch out;
-    append_tokens(out, impl_->encode_text_segment(std::string(kSpeaker0) + text), true);
+    append_tokens(out, impl_->get().encode_text_segment(std::string(kSpeaker0) + text), true);
     return out;
 }
 
@@ -106,10 +130,11 @@ BreezePromptBranch BreezeTextTokenizer::build_clone(
     const std::string & reference_text,
     int64_t reference_audio_frames) const {
     const std::string actual_instruction = instruction.empty() ? kDefaultInstruction : instruction;
+    const auto & loaded = impl_->get();
     BreezePromptBranch out;
-    append_tokens(out, impl_->encode_text_segment(std::string(kSpeaker0) + reference_text), true);
-    append_audio_placeholders(out, impl_->audio_token, impl_->audio_eos, reference_audio_frames);
-    append_tokens(out, impl_->encode_text_segment(
+    append_tokens(out, loaded.encode_text_segment(std::string(kSpeaker0) + reference_text), true);
+    append_audio_placeholders(out, loaded.audio_token, loaded.audio_eos, reference_audio_frames);
+    append_tokens(out, loaded.encode_text_segment(
         std::string(kSpeaker0) + kInstructionBos + actual_instruction + kInstructionEos + text), true);
     return out;
 }
@@ -118,19 +143,20 @@ BreezePromptBranch BreezeTextTokenizer::build_clone_negative(
     const std::string & text,
     const std::string & reference_text,
     int64_t reference_audio_frames) const {
+    const auto & loaded = impl_->get();
     BreezePromptBranch out;
-    append_tokens(out, impl_->encode_text_segment(std::string(kSpeaker0) + reference_text), true);
-    append_audio_placeholders(out, impl_->audio_token, impl_->audio_eos, reference_audio_frames);
-    append_tokens(out, impl_->encode_text_segment(std::string(kSpeaker0) + text), true);
+    append_tokens(out, loaded.encode_text_segment(std::string(kSpeaker0) + reference_text), true);
+    append_audio_placeholders(out, loaded.audio_token, loaded.audio_eos, reference_audio_frames);
+    append_tokens(out, loaded.encode_text_segment(std::string(kSpeaker0) + text), true);
     return out;
 }
 
 int32_t BreezeTextTokenizer::audio_token_id() const noexcept {
-    return impl_->audio_token;
+    return static_cast<int32_t>(assets_->config.audio_token_id);
 }
 
 int32_t BreezeTextTokenizer::audio_eos_token_id() const noexcept {
-    return impl_->audio_eos;
+    return static_cast<int32_t>(assets_->config.audio_eos_token_id);
 }
 
 }  // namespace engine::models::breeze_tts

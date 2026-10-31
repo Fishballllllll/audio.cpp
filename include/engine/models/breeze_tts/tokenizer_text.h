@@ -38,6 +38,7 @@ public:
 
 private:
     struct Impl;
+    std::shared_ptr<const BreezeTTSAssets> assets_;
     std::unique_ptr<Impl> impl_;
 };
 

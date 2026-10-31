@@ -8,6 +8,7 @@
 #include "engine/models/breeze_tts/assets.h"
 #include "engine/models/breeze_tts/speech_decoder.h"
 
+#include <filesystem>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -73,6 +74,7 @@ private:
     std::unique_ptr<BreezeGeneratorRuntime> generator_;
     engine::runtime::CacheSlots<ReferenceCacheKey, ReferenceCacheEntry, ReferenceCacheKeyEqual> reference_cache_;
     std::optional<ReferenceCacheEntry> uncached_reference_;
+    std::filesystem::path disk_cache_dir_;
 };
 
 }  // namespace engine::models::breeze_tts

@@ -54,6 +54,9 @@ TmpHostProf g_hp;
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <vector>
 
 namespace engine::models::breeze_tts {
@@ -474,12 +477,53 @@ struct BreezeWeights {
     core::TensorValue depth_heads;
 };
 
+// Host tables derived from the weights, kept under breeze_tts.disk_cache_dir:
+// reading them back is much cheaper than decoding or computing them again.
+constexpr uint64_t kFloatCacheMagic = 0x3153574f525a4252ull;
+
+bool read_float_cache(const std::filesystem::path & path, std::vector<float> & values) {
+    if (path.empty()) {
+        return false;
+    }
+    std::ifstream in(path, std::ios::binary);
+    uint64_t header[2] = {0, 0};
+    const uint64_t bytes = values.size() * sizeof(float);
+    return in.read(reinterpret_cast<char *>(header), sizeof(header)) && header[0] == kFloatCacheMagic &&
+        header[1] == bytes && in.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(bytes));
+}
+
+// Best effort: a failed write only means the next start computes the table again.
+void write_float_cache(const std::filesystem::path & path, const std::vector<float> & values) {
+    if (path.empty()) {
+        return;
+    }
+    auto temporary = path;
+    temporary += ".tmp";
+    std::error_code error;
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        const uint64_t header[2] = {kFloatCacheMagic, values.size() * sizeof(float)};
+        out.write(reinterpret_cast<const char *>(header), sizeof(header));
+        out.write(reinterpret_cast<const char *>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+        if (!out) {
+            out.close();
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+}
+
 std::shared_ptr<const BreezeWeights> load_weights(
     const BreezeTTSAssets & assets,
     core::ExecutionContext & execution,
     size_t weight_context_bytes,
     assets::TensorStorageType storage_type,
-    const modules::CausalDecoderRuntimeConfig & backbone_runtime_config) {
+    const modules::CausalDecoderRuntimeConfig & backbone_runtime_config,
+    const std::filesystem::path & cache_dir) {
+    const auto cache_path = [&](const char * name) {
+        return cache_dir.empty() ? std::filesystem::path{} : cache_dir / name;
+    };
     auto out = std::make_shared<BreezeWeights>();
     out->store = std::make_shared<core::BackendWeightStore>(
         execution.backend(),
@@ -538,7 +582,16 @@ std::shared_ptr<const BreezeWeights> load_weights(
     }
     out->depth.final_norm = binding::norm_weight_from_source(*out->store, source, "depth_decoder.model.norm", config.depth_hidden_size);
 
-    out->audio_embedding = source.require_f32("depth_decoder.model.embed_tokens.weight", {config.num_codebooks * config.vocab_size, config.hidden_size});
+    // Decoding these on the host takes about a second; it runs next to the upload.
+    auto audio_embedding_task = std::async(std::launch::async, [&] {
+        const auto path = cache_path("audio_embedding.bin");
+        out->audio_embedding.resize(static_cast<size_t>(config.num_codebooks * config.vocab_size * config.hidden_size));
+        if (!read_float_cache(path, out->audio_embedding)) {
+            out->audio_embedding = source.require_f32(
+                "depth_decoder.model.embed_tokens.weight", {config.num_codebooks * config.vocab_size, config.hidden_size});
+            write_float_cache(path, out->audio_embedding);
+        }
+    });
     {
         const ggml_type type = out->backbone.token_embedding.type;
         const bool float_type = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
@@ -551,11 +604,13 @@ std::shared_ptr<const BreezeWeights> load_weights(
             "depth_decoder.model.inputs_embeds_projector.weight",
             {config.depth_hidden_size, config.hidden_size}),
         std::nullopt};
+    std::vector<float> transposed_depth_heads(
+        static_cast<size_t>((config.num_codebooks - 1) * config.vocab_size * config.depth_hidden_size));
+    if (!read_float_cache(cache_path("depth_heads.bin"), transposed_depth_heads)) {
     const auto depth_heads = source.require_f32(
         "depth_decoder.codebooks_head.weight",
         {config.num_codebooks - 1, config.depth_hidden_size, config.vocab_size});
-    std::vector<float> transposed_depth_heads(
-        static_cast<size_t>((config.num_codebooks - 1) * config.vocab_size * config.depth_hidden_size));
+#pragma omp parallel for
     for (int64_t codebook = 0; codebook < config.num_codebooks - 1; ++codebook) {
         const int64_t in_codebook_offset = codebook * config.depth_hidden_size * config.vocab_size;
         const int64_t out_codebook_offset = codebook * config.vocab_size * config.depth_hidden_size;
@@ -567,10 +622,13 @@ std::shared_ptr<const BreezeWeights> load_weights(
             }
         }
     }
+    write_float_cache(cache_path("depth_heads.bin"), transposed_depth_heads);
+    }
     out->depth_heads = out->store->make_f32(
         core::TensorShape::from_dims({config.num_codebooks - 1, config.vocab_size, config.depth_hidden_size}),
-        transposed_depth_heads);
+        std::move(transposed_depth_heads));
     out->store->upload();
+    audio_embedding_task.get();
     return out;
 }
 
@@ -827,6 +885,10 @@ private:
 // the sampling noise, and downloads 15 tokens.
 class BreezeFusedDepthRuntime {
 public:
+    void set_rows_cache_path(std::filesystem::path path) {
+        rows_cache_path_ = std::move(path);
+    }
+
     BreezeFusedDepthRuntime(
         ggml_backend_t backend,
         core::BackendType backend_type,
@@ -1208,6 +1270,7 @@ private:
         const int64_t codebooks = config_.num_codebooks - 1;
         const size_t table_row = table_.tensor->nb[1];
         std::vector<float> rows(static_cast<size_t>(codebooks * vocab * depth_hidden));
+        if (!read_float_cache(rows_cache_path_, rows)) {
         std::vector<int32_t> tokens(static_cast<size_t>(vocab));
         for (int64_t token = 0; token < vocab; ++token) {
             tokens[static_cast<size_t>(token)] = static_cast<int32_t>(token);
@@ -1267,6 +1330,8 @@ private:
             engine::debug::trace_log_scalar("breeze_tts.fused_depth.embedding_rows_failed", std::string_view(error.what()));
             embedding_rows_failed_ = true;
             return;
+        }
+        write_float_cache(rows_cache_path_, rows);
         }
         embedding_rows_ = rows_store_.make_f32(
             core::TensorShape::from_dims({codebooks * vocab, depth_hidden}), std::move(rows));
@@ -1520,6 +1585,7 @@ private:
     core::BackendWeightStore rows_store_;
     core::TensorValue embedding_rows_;
     bool embedding_rows_failed_ = false;
+    std::filesystem::path rows_cache_path_;
     std::unique_ptr<ggml_context, GgmlContextDeleter> inputs_ctx_;
     ggml_backend_buffer_t inputs_buffer_ = nullptr;
     std::unique_ptr<ggml_context, GgmlContextDeleter> graph_ctx_;
@@ -1554,7 +1620,8 @@ struct BreezeGeneratorRuntime::Impl {
         assets::TensorStorageType storage_type,
         core::AttentionPreference attention_preference = core::AttentionPreference::Auto,
         Bf16ActivationMode bf16_activations = Bf16ActivationMode::Auto,
-        BreezePerfOptions perf = {})
+        BreezePerfOptions perf = {},
+        const std::filesystem::path & cache_dir = {})
         : assets(std::move(assets)),
           execution(execution),
           tokenizer(this->assets),
@@ -1583,7 +1650,7 @@ struct BreezeGeneratorRuntime::Impl {
         depth_runtime_config = depth_config(
             config, execution.backend_type(), graph_arena_bytes, allow_depth_flash, bf16_reference,
             perf.skip_cache_round);
-        weights = load_weights(*this->assets, execution, weight_context_bytes, storage_type, backbone_runtime_config);
+        weights = load_weights(*this->assets, execution, weight_context_bytes, storage_type, backbone_runtime_config, cache_dir);
         backbone_cond = std::make_unique<modules::CausalDecoderRuntime>(execution, backbone_runtime_config, weights->backbone);
         backbone_uncond = std::make_unique<modules::CausalDecoderRuntime>(execution, backbone_runtime_config, weights->backbone);
         // The performance paths are opt-in and only validated on CUDA; other
@@ -1601,6 +1668,9 @@ struct BreezeGeneratorRuntime::Impl {
                 depth_runtime_config,
                 *weights,
                 perf.cuda_depth);
+            if (!cache_dir.empty()) {
+                fused_depth->set_rows_cache_path(cache_dir / "embedding_rows.bin");
+            }
         } else {
             // The fused graph replaces the per-codebook depth runtimes entirely.
             depth_pair = std::make_unique<modules::CausalDecoderRuntime>(execution, depth_runtime_config, weights->depth);
@@ -2820,7 +2890,8 @@ BreezeGeneratorRuntime::BreezeGeneratorRuntime(
     engine::assets::TensorStorageType storage_type,
     engine::core::AttentionPreference attention_preference,
     Bf16ActivationMode bf16_activations,
-    BreezePerfOptions perf)
+    BreezePerfOptions perf,
+    const std::filesystem::path & cache_dir)
     : impl_(std::make_unique<Impl>(
           std::move(assets),
           execution,
@@ -2829,7 +2900,8 @@ BreezeGeneratorRuntime::BreezeGeneratorRuntime(
           storage_type,
           attention_preference,
           bf16_activations,
-          perf)) {}
+          perf,
+          cache_dir)) {}
 
 BreezeGeneratorRuntime::~BreezeGeneratorRuntime() = default;
 
